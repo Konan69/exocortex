@@ -40,7 +40,13 @@ const LINK_VERSION = 4;   // 4 = candidate names only in questions, 6 passages a
 // passages worse and up to 40x slower (eval.ts); and with one passage per request an independent LLM agrees with 54% of
 // Jev's links at 0.80-0.85, 80% at 0.85-0.90, 84% at 0.90-0.95, 96% at 0.95+ (kb audit, 2026-09-20) → 0.85.
 const DEDUPE_SHARE = Number(process.env.KB_DEDUPE_SHARE ?? 1);   // 1 = every passage of the copy exists in the kept document: nothing unique is lost
-const MENTION_FLOOR = 0.9, WORTHY_FLOOR = 0.4, TOPIC_FLOOR = 0.8, ABOUT_FLOOR = 0.4;   // 0.5 also dropped real definitions ("Mamba is a selective state-space model…" 0.47); passing mentions sit at 0.06-0.40   // example set 0.9 on 2026-09-20
+const MENTION_FLOOR = 0.9, WORTHY_FLOOR = 0.4, TOPIC_FLOOR = 0.8, ABOUT_FLOOR = 0.4;
+// A pair whose two names are the same string once spacing and punctuation go ("Work Stream" / "Workstream") arrives
+// already carrying its evidence — Jev is only asked to veto it, and it reads two passages that never use the same
+// spelling, so it hedges: of 33 such pairs only 9 reached 0.9, while every one from 0.82 up was right by hand
+// (example/VC OS 0.88, Workstream/Work Stream 0.88, example/Sand Water 0.85). Below 0.8 it starts refusing for a
+// reason (Flow Node/FlowNode 0.53, Optic O/Optico 0.22). Measured 2026-09-20.
+const ALIAS_FLOOR = 0.8;   // 0.5 also dropped real definitions ("Mamba is a selective state-space model…" 0.47); passing mentions sit at 0.06-0.40   // example set 0.9 on 2026-09-20
 
 const client = Client.server(HELIX);
 const tenantScope = Predicate.eq("tenant_id", TENANT);
@@ -1598,7 +1604,7 @@ async function audit(args: Args) {
 // same slug filed under two kinds. Jev decides, reading a passage that holds both. A confirmed pair is merged into the
 // better-held name: its links are re-pointed, the other name is kept in `aliases`, the emptied node goes.
 // kb entities --resolve [--from dir] [--yes]   (works from the latest backup; verdicts land in <backup>/resolve.jsonl)
-type Pairing = { a: number; b: number; chunk: number; same: number };
+type Pairing = { a: number; b: number; chunk: number; chunkB?: number; same: number };
 async function resolveEntities(args: Args) {
   const dir = latestBackup(args), log = join(dir, "resolve.jsonl");
   const entities = new Map(jsonl<EntityRow>(join(dir, "entities.jsonl")).map((entity) => [entity.$id, entity]));
@@ -1612,22 +1618,36 @@ async function resolveEntities(args: Args) {
     const key = `${a}>${b}`, entry = together.get(key) ?? { count: 0, chunk };
     entry.count++; together.set(key, entry);
   }
-  const candidates = [...together].map(([key, entry]) => { const [a, b] = key.split(">").map(Number); return { a, b, ...entry }; })
+  const candidates = [...together].map(([key, entry]) => { const [a, b] = key.split(">").map(Number); return { a, b, chunkB: entry.chunk, ...entry }; })
     .filter(({ a, b, count }) => entities.get(a)!.entityKey.split(":")[2] === entities.get(b)!.entityKey.split(":")[2] || (count >= 2 && count / Math.min(holders.get(a)!.size, holders.get(b)!.size) >= 0.5));
+  // Co-occurrence is blind to a pure alias: a writer picks ONE of "Workstream" / "Work Stream" per passage, so two
+  // names for one thing are exactly the pair that never turns up together. Names that are equal once spacing and
+  // punctuation are taken out are proposed as well, each side carrying a passage of its own. (44 such groups held
+  // 1,039 links — backup/experiment-alias-and-title-entities.ts. An initials detector was tried in the same
+  // experiment and thrown away: with short names it degenerates into "shares a first letter".)
+  const squashed = new Map<string, number[]>();
+  for (const id of holders.keys()) squashed.set(`${entities.get(id)!.kind}|${normalise(entities.get(id)!.name).replace(/-/g, "")}`, [...(squashed.get(`${entities.get(id)!.kind}|${normalise(entities.get(id)!.name).replace(/-/g, "")}`) ?? []), id]);
+  const seen = new Set(candidates.map(({ a, b }) => `${a}>${b}`));
+  for (const ids of squashed.values()) for (let i = 1; i < ids.length; i++) {
+    const [a, b] = ids[0] < ids[i] ? [ids[0], ids[i]] : [ids[i], ids[0]];
+    if (seen.has(`${a}>${b}`)) continue;
+    seen.add(`${a}>${b}`);
+    candidates.push({ a, b, count: 0, chunk: [...holders.get(a)!][0], chunkB: [...holders.get(b)!][0] });
+  }
   const done = new Set(jsonl<Pairing>(log).map((row) => `${row.a}>${row.b}`));
   let pending = candidates.filter(({ a, b }) => !done.has(`${a}>${b}`));
   if (args.values("--limit").length) pending = pending.slice(0, args.number("--limit", pending.length));
-  console.log(`${dir}\n${candidates.length} candidate pairs from co-occurrence · ${done.size} already judged · ${pending.length} to judge → ${pending.length} Jev requests (one pair each)`);
+  console.log(`${dir}\n${candidates.length} candidate pairs (${candidates.filter((pair) => pair.count > 0).length} share passages, ${candidates.filter((pair) => pair.count === 0).length} spelling variants) · ${done.size} already judged · ${pending.length} to judge → ${pending.length} Jev requests (one pair each)`);
   const pages: typeof pending[] = [];
   for (let start = 0; start < pending.length; start += 1) pages.push(pending.slice(start, start + 1));   // one pair per request — packed items leak into each other
   let judged = 0;
   await pool(pages, JEV_IN_FLIGHT, async (page) => {
-    const data = await read<{ chunks: any[] | null }>(readBatch().varAs("chunks", g().n([...new Set(page.map((pair) => pair.chunk))]).project([PropertyProjection.renamed("$id", "id"), ...fields("content")])).returning(["chunks"]), "passages_for_pairs");
+    const data = await read<{ chunks: any[] | null }>(readBatch().varAs("chunks", g().n([...new Set(page.flatMap((pair) => [pair.chunk, pair.chunkB ?? pair.chunk]))]).project([PropertyProjection.renamed("$id", "id"), ...fields("content")])).returning(["chunks"]), "passages_for_pairs");
     const textOf = new Map((data.chunks ?? []).map((chunk) => [Number(chunk.id), chunk.content as string]));
     const questions: Record<string, Question> = {};
     page.forEach((_, index) => { questions[`q${index}`] = noul(`In q${index}, a and b are two names for one and the same thing (not merely related, not part and whole, not competitors)`); });
-    const answers = await jev({ pairs: Object.fromEntries(page.map((pair, index) => [`q${index}`, { a: `${entities.get(pair.a)!.name} (${entities.get(pair.a)!.kind})`, b: `${entities.get(pair.b)!.name} (${entities.get(pair.b)!.kind})`, passage_holding_both: textOf.get(pair.chunk) ?? "" }])) }, questions);
-    appendFileSync(log, page.map((pair, index) => JSON.stringify({ a: pair.a, b: pair.b, chunk: pair.chunk, same: answers[`q${index}`]?.noul ?? 0 })).join("\n") + "\n");
+    const answers = await jev({ pairs: Object.fromEntries(page.map((pair, index) => [`q${index}`, { a: `${entities.get(pair.a)!.name} (${entities.get(pair.a)!.kind})`, b: `${entities.get(pair.b)!.name} (${entities.get(pair.b)!.kind})`, passage_using_a: textOf.get(pair.chunk) ?? "", passage_using_b: textOf.get(pair.chunkB ?? pair.chunk) ?? "" }])) }, questions);
+    appendFileSync(log, page.map((pair, index) => JSON.stringify({ a: pair.a, b: pair.b, chunk: pair.chunk, chunkB: pair.chunkB, same: answers[`q${index}`]?.noul ?? 0 })).join("\n") + "\n");
     judged += page.length;
     if (judged % 200 === 0) console.log(`[${new Date().toTimeString().slice(0, 8)}] ${judged}/${pending.length} pairs · ${usage.jevCalls} jev`);
   });
@@ -1639,8 +1659,11 @@ async function resolveEntities(args: Args) {
   const bySlug = new Map<string, number[]>();
   for (const id of entities.keys()) bySlug.set(slugOf(id), [...(bySlug.get(slugOf(id)) ?? []), id]);
   const sameName: Pairing[] = [...bySlug.values()].filter((ids) => ids.length > 1).flatMap((ids) => ids.slice(1).map((id) => ({ a: ids[0], b: id, chunk: 0, same: 1 })));
-  const confirmed = [...sameName, ...jsonl<Pairing>(log).filter((row) => row.same >= 0.9 && entities.has(row.a) && entities.has(row.b) && slugOf(row.a) !== slugOf(row.b))];
-  console.log(`${sameName.length} same-name pairs (merged without asking) · ${confirmed.length - sameName.length} confirmed by Jev`);
+  const squashOf = (id: number) => normalise(entities.get(id)!.name).replace(/-/g, "");
+  const isVariant = (row: Pairing) => squashOf(row.a) === squashOf(row.b);
+  const verdicts = jsonl<Pairing>(log).filter((row) => entities.has(row.a) && entities.has(row.b) && slugOf(row.a) !== slugOf(row.b));
+  const confirmed = [...sameName, ...verdicts.filter((row) => row.same >= (isVariant(row) ? ALIAS_FLOOR : 0.9))];
+  console.log(`${sameName.length} same-name pairs (merged without asking) · ${confirmed.filter((row) => !isVariant(row)).length - sameName.length} confirmed by Jev at 0.9 · ${confirmed.filter(isVariant).length} spelling variants at ${ALIAS_FLOOR}`);
   const parent = new Map<number, number>(), find = (id: number): number => { while (parent.get(id) !== undefined && parent.get(id) !== id) id = parent.get(id)!; return id; };
   for (const { a, b } of confirmed) parent.set(find(a), find(b));
   const groups = new Map<number, number[]>();

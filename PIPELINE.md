@@ -95,6 +95,27 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   linked artists after the definition said a tracklist / line-up / participants list counts).
 - **Hubs are not walked.** An entity held by more than 60 passages says nothing about any one of them. Graph expansion
   skips them and weights a shared entity by `1 / log2(1 + passages holding it)`. Hubs still work as filters.
+- **A name missing from its passage is not a wrong link.** The two wrong links in the re-audit both named something
+  the passage never says, so the whole graph was measured for it: 669 of 20,997 links (3.2%) contain no word of the
+  entity's name, 336 of them topics. 37 of the non-topic ones were read by hand — **33 hold, 4 weak, 0 wrong**. The
+  passage almost always *does* say the name, differently: a transcript garbles it (Gardin/Garden, school/Skool,
+  Olama/Ollama, Lyola/Loyola, Traer board/Trello, Sanwater/example, three MTT/3MTT, Sarte/Sartre), a 16th-century
+  translation spells it its own way (Romaines, Souldan, Carminiola), it is abbreviated (DDVC = DataDriven VC), the
+  subject is named by role ("the duke" = Cesare Borgia) or is the first-person speaker of an interview. **A "the name
+  must appear" rule was therefore rejected** — it would delete ~300 links, ~90% of them right, and it is exactly the
+  string rule Jev exists to replace. (`experiment-absent-names.ts`; the same run showed spacing and punctuation
+  variants must be matched before calling a name absent — "VC OS" is written example.)
+- **Aliases are the pairs that never co-occur.** Resolution proposed merges from entities that keep turning up in the
+  *same* passages, which is blind to a pure alias: a writer picks ONE of "Workstream" / "Work Stream" per passage, so
+  substitutes are precisely the names that never appear together. 44 such groups held 1,039 links. They are proposed
+  now by squashing spacing and punctuation out of the name, each side carrying a passage of its own, and they get
+  their own floor (`ALIAS_FLOOR` 0.8): the string evidence is already in hand and Jev is only asked to veto, so it
+  hedges — of 33 pairs only 9 reached 0.9 while every one from 0.82 up was right by hand. An initials detector was
+  tried in the same experiment and thrown away: on short names it degenerates into "shares a first letter".
+  (`experiment-alias-and-title-entities.ts`)
+- **Document-title entities are not a problem.** The same experiment looked for entities whose links all sit in one
+  document and cover most of it — 27 entities, 96 links, and most are genuine subjects (a podcast's interviewee, the
+  tools a blog post is a list of). Nothing to cut.
 - **LLM output is never trusted unchecked.** GLM proposes ~3x more names than survive Jev's check.
 - **Edges are deleted by id.** `.drop()` is a node mutation; on an edge stream Helix v0.0.5 silently does nothing
   (filed: HelixDB/helix-db#1109). Use `g().dropEdgeById(ids | EdgeRef.var(name))`. Node `.drop()` cascades its edges.
@@ -141,6 +162,7 @@ Full restore: `backup/helix-volume-2026-09-20-preprune.tgz` is the whole Helix v
 | 2026-09-20 | resolve: same name = one node (1,380 pairs) + 101 Jev-confirmed aliases → 1,216 merges | 46,857 | 13,622 |
 | 2026-09-20 | **dedupe: 1,270 documents were 100% passage-for-passage copies** (old "recovered" store) → 2,659 docs · 17,028 passages | 30,772 | 13,622 |
 | 2026-09-20 | **about-test** on every link ($0.58): −9,780 (7,704 only mentioned in passing, 3,539 failing the mean) → 20,992 | 20,992 | ~10,400 |
+| 2026-09-20 | resolve, second pass: spelling variants proposed and merged at 0.8 (example/VC OS, Workstream/Work Stream, example/Sand Water, …) → 44 merges, 45 entities folded, 122 links collapsed | 20,875 | 8,592 |
 | 2026-09-20 | (before that) prune 3,221 orphan entities; relate: 4,613 pairs judged ($0.42) → 332 RELATES_TO, 290 EXTENDS, 4 UPDATES; 2,634 entity associations; owner + profile + 10 category parents | 30,772 | ~10,400 |
 
 Search eval (graph-reached passages; grading method changed on 09-20 to one passage per request, so compare each
@@ -164,9 +186,18 @@ passing kept.
 partner list) · 2 wrong (5%: acquisition.com and value-based pricing, neither named nor discussed in the passage).
 Before the about-test: 75% held, 15% wrong. Sample: `backup/audit-sample-2026-09-20-18-03.jsonl`.
 
+**Targeted audit of the absent-name links (Claude, 40 draws / 37 distinct links, whole passages):** 33 hold · 4 weak
+(three of them the name of a recurring meeting series attached to a passage of that meeting; one an unnamed Ramp ad) ·
+**0 wrong**. This is the audit that killed the "the name must appear in the passage" rule and turned up the alias gap
+above. Sample: `backup/absent-sample-2026-09-20-20-21.jsonl`.
+
 ## Open
 
-1. The 2 wrong links in the re-audit were both absent-name links surviving two readings — worth a targeted look (links whose name appears nowhere in the passage, non-topic kinds).
+1. (closed) Absent-name links were measured and audited: 3.2% of links, 0 of 37 wrong. No rule added; the alias gap it
+   exposed was fixed instead. See "A name missing from its passage is not a wrong link" above.
 2. (closed) Ranking boost from the graph was tested and removed: top-8 0.845 plain vs 0.842 boosted over 20 queries, 16 of 160 slots changed (`eval-rank.ts`, 2026-09-20). Ranking stays vector + BM25 + Jev rerank; the graph filters and cross-references.
-3. 53 documents are 80-99% copies of another; ~4k entities are held by one passage; the in-memory pool is untimed.
-4. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
+3. 2,624 entities are held by a single passage — is one mention enough to earn a node? Needs a sample, not a rule.
+4. 53 documents are 80-99% copies of another (only 100% copies were removed).
+5. The in-memory pool and early-acknowledged writes are built but never timed.
+6. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
+7. Port the remaining Python fetchers (`fetch_*.py`, `fetch_dj.py`) into `kb`.
