@@ -1561,6 +1561,18 @@ async function check() {
   line("  held by no link and no document", Math.max(0, entities - held.size), entities - held.size <= 0);
   line("  held by one passage", perEntity.filter((row) => row.count === 1).length);
   line(`  hubs (over ${HUB} passages, not walked)`, `${hubs.length} holding ${hubs.reduce((sum, row) => sum + row.count, 0)} links`);
+  // structural invariants, carried over from the Python audit_v4.py this replaces: a document with no passages was
+  // half-ingested, two documents under one documentId make every lookup ambiguous, and a passage whose document is
+  // gone can never be found by anything that starts from a document.
+  const documentIds = ((await one<{ documentId: string }[]>("documents", g().nWithLabel("SourceDocument").where(tenantScope).project(fields("documentId")))) ?? []).map((row) => row.documentId);
+  const chunksPer = new Map(((await one<{ count: number; documentId: string }[]>("chunks_per_document", g().nWithLabel("Chunk").where(tenantScope).groupCount("documentId"))) ?? []).map((row) => [row.documentId, row.count]));
+  const seen = new Set<string>(), duplicates = documentIds.filter((id) => seen.size === seen.add(id).size);
+  const empty = [...new Set(documentIds)].filter((id) => !chunksPer.has(id));
+  const orphans = [...chunksPer].filter(([id]) => !seen.has(id));
+  line("documents", seen.size);
+  line("  with no passages", empty.length + (empty.length ? ` (e.g. ${empty.slice(0, 3).join(" · ")})` : ""), empty.length === 0);
+  line("  sharing a documentId with another", duplicates.length + (duplicates.length ? ` (e.g. ${duplicates.slice(0, 3).join(" · ")})` : ""), duplicates.length === 0);
+  line("  passages whose document is gone", orphans.reduce((sum, [, count]) => sum + count, 0) + (orphans.length ? ` in ${orphans.length} missing documents` : ""), orphans.length === 0);
   if (broken) process.exit(1);
 }
 

@@ -20,21 +20,23 @@ const QUERIES = [
 ];
 
 const client = Client.server("http://localhost:6972");
-const env = readFileSync(join(homedir(), "work/example/apps/web/.env"), "utf8");
-const secret = (name: string) => env.match(new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*["']?([^"'\\n]+)`, "m"))![1].trim();
+// Same Jev route kb.ts uses (OpenRouter /api/alpha/decisions); the Cloudflare gateway drops sockets under this load.
+const jevKey = process.env.OPENROUTER_API_KEY ?? JSON.parse(readFileSync(join(homedir(), ".pi/agent/auth.json"), "utf8")).openrouter.key;
 
 // One passage per request: several passages in one Jev request leak into each other (measured 2026-09-20).
+// A dropped socket is retried like a refused request — the loop must catch throws, not only bad statuses.
 async function grade(query: string, passages: string[]): Promise<number[]> {
   return Promise.all(passages.map(async (passage) => {
     if (!passage.trim()) return 0;
     for (let attempt = 0; ; attempt++) {
-      const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${secret("CLOUDFLARE_ACCOUNT_ID")}/ai/run`, {
+      const answer = await fetch("https://openrouter.ai/api/alpha/decisions", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret("CLOUDFLARE_API_TOKEN")}`, "cf-aig-gateway-id": "example-dev", "cf-aig-authorization": `Bearer ${secret("CF_AIG_TOKEN")}`, "cf-aig-metadata": JSON.stringify({ workload: "example-kb-eval" }) },
-        body: JSON.stringify({ model: "typesafe/jev", input: { state: { request: query, passage }, questions: { useful: { type: "noul", instructions: "The passage answers the request or contains information directly useful for it" } } } }),
-      });
-      if (response.ok) return (((await response.json()) as any).result.result.answers.useful?.noul ?? 0) as number;
-      if (attempt === 8) throw new Error(`jev HTTP ${response.status}`);
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${jevKey}` },
+        body: JSON.stringify({ model: "typesafe/jev-1.13", state: { request: query, passage }, questions: { useful: { type: "noul", instructions: "The passage answers the request or contains information directly useful for it" } } }),
+        signal: AbortSignal.timeout(120_000),
+      }).then(async (response) => response.ok ? (((await response.json()) as any).answers.useful?.noul ?? 0) as number : Promise.reject(new Error(`HTTP ${response.status}`)))
+        .catch((error) => { if (attempt === 8) throw error; return null; });
+      if (answer !== null) return answer;
       await Bun.sleep(2500 * (attempt + 1));
     }
   }));

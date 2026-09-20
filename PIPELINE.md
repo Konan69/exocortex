@@ -111,6 +111,10 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   must appear" rule was therefore rejected** — it would delete ~300 links, ~90% of them right, and it is exactly the
   string rule Jev exists to replace. (`experiment-absent-names.ts`; the same run showed spacing and punctuation
   variants must be matched before calling a name absent — "VC OS" is written example.)
+- **There is no error pocket where "absent name" meets "only one passage holds it".** The obvious follow-up to the
+  two findings above — that the tail of thin entities is where absent-name links go wrong — is false: the two
+  conditions intersect in 29 links, 0.1% of the graph, and the names in it are the same spelling cases as everywhere
+  else (Sarte/Sartre, Carminiola/Carmignola, Caesar, Pyrrhus). Nothing to fix.
 - **Aliases are the pairs that never co-occur.** Resolution proposed merges from entities that keep turning up in the
   *same* passages, which is blind to a pure alias: a writer picks ONE of "Workstream" / "Work Stream" per passage, so
   substitutes are precisely the names that never appear together. 44 such groups held 1,039 links. They are proposed
@@ -124,7 +128,7 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   tools a blog post is a list of). Nothing to cut.
 - **LLM output is never trusted unchecked.** GLM proposes ~3x more names than survive Jev's check.
 - **Edges are deleted by id.** `.drop()` is a node mutation; on an edge stream Helix v0.0.5 silently does nothing
-  (filed: HelixDB/helix-db#1109). Use `g().dropEdgeById(ids | EdgeRef.var(name))`. Node `.drop()` cascades its edges.
+  (filed: HelixDB/helix-db#1109 — HelixDB replied "investigating will fix shortly" on 2026-09-20). Use `g().dropEdgeById(ids | EdgeRef.var(name))`. Node `.drop()` cascades its edges.
   `outN()` of an out-edge is its target, `inN()` its source.
 - **The in-memory pool halves Helix's share of a corpus pass.** Timed on the same 288 and 576 passages, reads only,
   no writes and no model calls: 36 ms a passage through the traversals, 19 ms with the pool (vector search still goes
@@ -221,4 +225,9 @@ above. Sample: `backup/absent-sample-2026-09-20-20-21.jsonl`.
    a label you can search or filter by. Cutting them is cutting true information, so it is a policy call, not a quality
    one — **example's to make.** Sample: `backup/single-sample-2026-09-20-20-53.jsonl`.
 6. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
-7. Port the remaining Python fetchers (`fetch_*.py`, `fetch_dj.py`) into `kb`.
+7. (closed) The remaining Python is **acquisition, not pipeline**, and stays: `fetch_videos.py`, `fetch_jxnl.py`,
+   `fetch_dj.py`, `fetch_inference_mohit.py` download and write markdown into a directory, which `kb ingest <dir>`
+   then owns. Nothing is gained by rewriting a working downloader in TypeScript. What did need porting was
+   `audit_v4.py`'s three structural checks — a document with no passages, two documents under one documentId, a
+   passage whose document is gone — and those are now in `kb check`. `audit_v4.py` and `cleanup_v4.py` (which drives
+   the deleted `migrate_v2.py`) are dead; they are not deleted here because deleting is example's call.
