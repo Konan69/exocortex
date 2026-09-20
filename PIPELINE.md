@@ -88,6 +88,12 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   reliable for people ("Jeremy Howard" 0.22 in a passing mention), so it decides topics only.
 - **Check for copies before anything else.** A third of the corpus was the same documents ingested twice; every pass
   paid for them. `kb dedupe` compares passages by a hash of whitespace-collapsed text (identical, not similar).
+- **The header passage is not content.** After the exact-copy sweep, 53 documents still sat at 80-99% identical, and
+  every one of them missed a full match by a single passage. In 51 of the 53 that passage was the *first* one — the
+  metadata block (title, speaker, source URL), written differently by the two ingests of the same video. Headers ran
+  134-216 characters; the only first passage carrying real text was 3,801, so the copy test ignores a document's
+  first passage when it is under 500 characters. That found 65 documents (638 passages) whose every content passage
+  already existed elsewhere, and left alone the two that differ mid-document and the blog post with a long opening.
 - **Same name = same node.** The entity key carried the kind, so "PyHarness" existed as a project and a product. Shown
   the two kinds Jev calls them different (0 of 425 reached 0.9), so identical normalised names merge without asking and
   `kb name` reuses an existing name under whatever kind it has. Jev decides aliases ("RAG" = "retrieval-augmented generation").
@@ -120,6 +126,11 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
 - **Edges are deleted by id.** `.drop()` is a node mutation; on an edge stream Helix v0.0.5 silently does nothing
   (filed: HelixDB/helix-db#1109). Use `g().dropEdgeById(ids | EdgeRef.var(name))`. Node `.drop()` cascades its edges.
   `outN()` of an out-edge is its target, `inN()` its source.
+- **The in-memory pool halves Helix's share of a corpus pass.** Timed on the same 288 and 576 passages, reads only,
+  no writes and no model calls: 36 ms a passage through the traversals, 19 ms with the pool (vector search still goes
+  to Helix; the rest is a map lookup), and both paths gather the identical candidate set — 9,380 / 28,129 candidates,
+  exactly equal, which is the correctness check as well as the timing one. Over 16,394 passages that is ~10 minutes
+  of Helix reads against ~5, plus a 5-9 s one-off load. Reproduced twice. (`experiment-pool-timing.ts`)
 - **Throughput.** Cloudflare's gateway refuses past ~250 requests/min ("Wholesale rate limit", code 2018); OpenRouter
   took 40 requests/s without refusing (latency climbs; ~8/s effective from Lagos). With Jev unthrottled the bound is
   Helix: one core, reads and writes share it → bulk passes use an in-memory pool (links + rosters loaded once; Helix is
@@ -162,6 +173,7 @@ Full restore: `backup/helix-volume-2026-09-20-preprune.tgz` is the whole Helix v
 | 2026-09-20 | resolve: same name = one node (1,380 pairs) + 101 Jev-confirmed aliases → 1,216 merges | 46,857 | 13,622 |
 | 2026-09-20 | **dedupe: 1,270 documents were 100% passage-for-passage copies** (old "recovered" store) → 2,659 docs · 17,028 passages | 30,772 | 13,622 |
 | 2026-09-20 | **about-test** on every link ($0.58): −9,780 (7,704 only mentioned in passing, 3,539 failing the mean) → 20,992 | 20,992 | ~10,400 |
+| 2026-09-20 | dedupe, second pass: headers excluded from the copy test → 65 more documents were copies, −638 passages, −366 links, −28 orphan entities | 20,509 | 8,564 |
 | 2026-09-20 | resolve, second pass: spelling variants proposed and merged at 0.8 (example/VC OS, Workstream/Work Stream, example/Sand Water, …) → 44 merges, 45 entities folded, 122 links collapsed | 20,875 | 8,592 |
 | 2026-09-20 | (before that) prune 3,221 orphan entities; relate: 4,613 pairs judged ($0.42) → 332 RELATES_TO, 290 EXTENDS, 4 UPDATES; 2,634 entity associations; owner + profile + 10 category parents | 30,772 | ~10,400 |
 
@@ -197,7 +209,16 @@ above. Sample: `backup/absent-sample-2026-09-20-20-21.jsonl`.
    exposed was fixed instead. See "A name missing from its passage is not a wrong link" above.
 2. (closed) Ranking boost from the graph was tested and removed: top-8 0.845 plain vs 0.842 boosted over 20 queries, 16 of 160 slots changed (`eval-rank.ts`, 2026-09-20). Ranking stays vector + BM25 + Jev rerank; the graph filters and cross-references.
 3. 2,624 entities are held by a single passage — is one mention enough to earn a node? Needs a sample, not a rule.
-4. 53 documents are 80-99% copies of another (only 100% copies were removed).
-5. The in-memory pool and early-acknowledged writes are built but never timed.
+4. (closed) The 53 documents at 80-99% were the same videos ingested twice, differing only in their header passage;
+   65 documents went once the header stopped counting as content. See "The header passage is not content" above.
+5. (closed) The in-memory pool was timed: it halves Helix's read cost on a corpus pass and returns the identical
+   candidates. Early-acknowledged writes (`drainFast`) are still untimed — they are a write-path change and would
+   need a real pass to measure.
+8. **2,650 entities (53% of them, 13% of links) are held by exactly one passage.** They are mostly real and specific
+   ("How to Win Friends and Influence People", "Linux kernel", "Independent Petroleum Marketers Association of
+   Nigeria"), with a junk tail ("ridge point", "Pastry", "Lib_sheet.gs"). A single-passage entity can never be walked,
+   never joins two passages and never proposes a crosslink, so it adds nothing the eval can see; its only job is to be
+   a label you can search or filter by. Cutting them is cutting true information, so it is a policy call, not a quality
+   one — **example's to make.** Sample: `backup/single-sample-2026-09-20-20-53.jsonl`.
 6. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
 7. Port the remaining Python fetchers (`fetch_*.py`, `fetch_dj.py`) into `kb`.

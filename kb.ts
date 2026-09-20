@@ -1297,15 +1297,22 @@ async function model(args: Args) {
 async function dedupe(args: Args) {
   const dir = latestBackup(args);
   const chunks = jsonl<{ $id: number; documentId: string }>(join(dir, "chunks.jsonl"));
-  const hashOf = new Map<number, string>();
+  const hashOf = new Map<number, string>(), lengthOf = new Map<number, number>();
   for (let start = 0; start < chunks.length; start += 400) {
     const data = await read<{ rows: { id: number; content: string }[] | null }>(readBatch().varAs("rows", g().n(chunks.slice(start, start + 400).map((chunk) => chunk.$id)).project([PropertyProjection.renamed("$id", "id"), ...fields("content")])).returning(["rows"]), "dedupe_texts");
-    for (const row of data.rows ?? []) hashOf.set(Number(row.id), createHash("sha256").update((row.content ?? "").replace(/\s+/g, " ").trim()).digest("hex"));
+    for (const row of data.rows ?? []) { hashOf.set(Number(row.id), createHash("sha256").update((row.content ?? "").replace(/\s+/g, " ").trim()).digest("hex")); lengthOf.set(Number(row.id), (row.content ?? "").length); }
   }
+  // The header passage is not content. Ingesting the same video twice writes the same transcript under two ids but
+  // formats the metadata block differently, so 53 documents missed a 100% match by exactly that one passage (51 of
+  // them by the first passage alone, measured 2026-09-20). Headers ran 134-216 characters; the one first passage that
+  // carried real text was 3,801, so a document's first passage is ignored by the copy test when it is under 500.
+  const firstOf = new Map<string, number>();
+  for (const chunk of chunks) if (!firstOf.has(chunk.documentId) || chunk.$id < firstOf.get(chunk.documentId)!) firstOf.set(chunk.documentId, chunk.$id);
+  const isHeader = (chunk: { $id: number; documentId: string }) => firstOf.get(chunk.documentId) === chunk.$id && (lengthOf.get(chunk.$id) ?? 0) < 500;
   const documents = (await read<{ rows: Doc[] | null }>(readBatch().varAs("rows", g().nWithLabel("SourceDocument").where(tenantScope).project(fields("documentId", "title", "kind", "source"))).returning(["rows"]), "dedupe_documents")).rows ?? [];
   const docOf = new Map(documents.map((doc) => [doc.documentId, doc]));
   const hashesOf = new Map<string, Set<string>>(), docsWith = new Map<string, Set<string>>();
-  for (const chunk of chunks) { const hash = hashOf.get(chunk.$id); if (!hash) continue;
+  for (const chunk of chunks) { const hash = hashOf.get(chunk.$id); if (!hash || isHeader(chunk)) continue;
     (hashesOf.get(chunk.documentId) ?? hashesOf.set(chunk.documentId, new Set()).get(chunk.documentId)!).add(hash);
     (docsWith.get(hash) ?? docsWith.set(hash, new Set()).get(hash)!).add(chunk.documentId); }
   const rank = (documentId: string) => hashesOf.get(documentId)!.size * 4 + (docOf.get(documentId)?.kind && docOf.get(documentId)!.kind !== "recovered" ? 2 : 0) + (documentId.startsWith("rec-") ? 0 : 1);
