@@ -835,7 +835,7 @@ async function ingest(args: Args) {
 
 type Args = { positional: string[]; values: (name: string) => string[]; has: (name: string) => boolean; number: (name: string, fallback: number) => number };
 
-const BOOLEAN_FLAGS = new Set(["--graph-rank", "--replace", "--all-entities", "--chunks", "--full", "--no-graph", "--no-rerank", "--json", "--dry-run", "--redo", "--seed", "--resolve", "--mine", "--with-boilerplate", "--yes"]);
+const BOOLEAN_FLAGS = new Set(["--replace", "--all-entities", "--chunks", "--full", "--no-graph", "--no-rerank", "--json", "--dry-run", "--redo", "--seed", "--resolve", "--mine", "--with-boilerplate", "--yes"]);
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [], flags = new Map<string, string[]>();
   for (let index = 0; index < argv.length; index++) {
@@ -958,18 +958,6 @@ async function search(args: Args) {
       if (entry.relevance !== undefined) entry.score = entry.relevance + 0.2 * entry.score;
     }));
     ranked = [...pool.sort((a, b) => b.score - a.score), ...ranked.slice(pool.length)];
-  }
-  // --graph-rank (experimental, measured by eval-rank.ts): a hit that shares specific entities with the other leading hits
-  // is corroborated by the graph and moves up a little.
-  if (args.has("--graph-rank") && ranked.length > 1) {
-    const lead = ranked.slice(0, Math.max(top * 2, 12));
-    let batch: any = readBatch();
-    lead.forEach((entry, index) => { batch = batch.varAs(`e${index}`, g().n(entry.hit.id).out("MENTIONS").project([PropertyProjection.renamed("$id", "id")])); });
-    const held = await read<Record<string, { id: number }[] | null>>(batch.returning(lead.map((_, index) => `e${index}`)), "graph_rank");
-    const sets = lead.map((_, index) => new Set((held[`e${index}`] ?? []).map((row) => Number(row.id)))), seen = new Map<number, number>();
-    for (const set of sets) for (const id of set) seen.set(id, (seen.get(id) ?? 0) + 1);
-    lead.forEach((entry, index) => { const corroborated = [...sets[index]].filter((id) => seen.get(id)! >= 2 && seen.get(id)! <= lead.length / 2).length; entry.score += 0.05 * Math.min(3, corroborated); });
-    ranked = [...lead.sort((a, b) => b.score - a.score), ...ranked.slice(lead.length)];
   }
   if (!args.has("--chunks")) {
     const perDocument = new Map<string, Ranked>();

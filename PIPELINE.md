@@ -157,12 +157,16 @@ without it on the same queries; the eval's per-query "added latency" column is n
 models") · 4 could not be judged because the sample file truncated passages (fixed: `kb audit` now writes whole
 passages with edge and chunk ids). Those 6 all scored 0.92-0.97 on "discusses" — the reason the `about` test exists.
 `backup/experiment-passing-mentions.ts`: with `about ≥ 0.4`, 27/30 good links kept, 20/20 tracklist links kept, 2/6
-passing kept. Not yet re-audited after the about-test was applied.
+passing kept.
+
+**Re-audit after the about-test (Claude, 40 random links of the 20,997-link graph, whole passages):** 34 hold (85%) ·
+4 weak (two "Org: Example Research" meeting headers, COVID-19 as the backdrop of a story, MTN as one of three names in a
+partner list) · 2 wrong (5%: acquisition.com and value-based pricing, neither named nor discussed in the passage).
+Before the about-test: 75% held, 15% wrong. Sample: `backup/audit-sample-2026-09-20-18-03.jsonl`.
 
 ## Open
 
-1. Re-audit a fresh sample of the 20,992-link graph (Claude or sol, from `kb audit`).
-2. Ranking: `--graph-rank` is experimental; result of `eval-rank.ts` is in `eval.history.jsonl`.
+1. The 2 wrong links in the re-audit were both absent-name links surviving two readings — worth a targeted look (links whose name appears nowhere in the passage, non-topic kinds).
+2. (closed) Ranking boost from the graph was tested and removed: top-8 0.845 plain vs 0.842 boosted over 20 queries, 16 of 160 slots changed (`eval-rank.ts`, 2026-09-20). Ranking stays vector + BM25 + Jev rerank; the graph filters and cross-references.
 3. 53 documents are 80-99% copies of another; ~4k entities are held by one passage; the in-memory pool is untimed.
 4. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
-5. After this round of cuts the hygiene commands need a fresh `kb backup`; orphan entities have not been re-pruned.
