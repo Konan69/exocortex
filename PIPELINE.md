@@ -35,16 +35,23 @@ The unit of knowledge is the **Chunk** (atomic `Memory` nodes were built, then d
 | Jev (`typesafe/jev-1.13` via OpenRouter; Cloudflare gateway `example-dev` as the alternative) | every decision: is X discussed here, category, salience, about example, boilerplate, is something unnamed, is a name node-worthy, are two names one thing, does a passage answer the query | typed answers with probabilities, $0.042 / 1M tokens, ~2 s |
 | GLM (`z-ai/glm-5.3-flash`, OpenRouter, `reasoning: minimal`) | the only writing: names entities Jev flagged as missing, drafts the taxonomy | Jev cannot write text. (Auditing Jev's links is done by Claude or sol from `kb audit`'s sample file, not by GLM) |
 
-## Ingest (per document, one command: `kb ingest <dir>`)
+## Ingest (per document, one command: `kb ingest <dir>`) — a document enters the graph already clean
 
+0. **copy check** — every passage has a `contentHash` (whitespace-collapsed text, sha256). If another document already
+   holds every passage of this one, it is skipped as a copy.
 1. chunk (4,000 chars) → embed (`text-embedding-3-small`) → one write: document + chunks.
 2. **link** — Helix shortlists ≤30 candidate entities per chunk (its 8 nearest chunks' links + their documents'
    rosters + its own links); Jev answers per chunk: category, salience, owner, boilerplate, "is something discussed
    that is not in the list", and one yes/no per candidate. 6 passages per request. **Candidate names appear only in
    the questions, never in the passage state.** A mention is written only at **confidence ≥ 0.9** (`MENTION_FLOOR`).
-3. **name** — only for chunks Jev flagged: GLM lists what is missing (12 passages a call; its prompt carries Jev's two
-   tests verbatim). Jev checks every proposed name in its passage: `discusses ≥ 0.9`, and for **topics**
-   `node_worthy ≥ 0.8` (other kinds ≥ 0.4). Edges carry Jev's confidence and `by: "llm+jev"`.
+3. **name** — only for chunks Jev flagged: GLM lists what is missing (12 passages a call; its prompt carries Jev's
+   tests verbatim; a name that exists under any kind is reused). Jev checks every proposed name in its passage:
+   `discusses ≥ 0.9`, `about ≥ 0.4`, and for **topics** `node_worthy ≥ 0.8` (other kinds ≥ 0.4).
+4. **settle** (`settleDocument`) — every link gets its second reading (mean of the two ≥ 0.9 and `about ≥ 0.4`);
+   an entity on ≥50% of the passages moves to one document link; passages are crosslinked (`RELATES_TO` / `EXTENDS` /
+   `UPDATES`, typed by Jev) to passages of other documents sharing 2+ walkable entities.
+
+Measured on a 4-passage document: 0.4 min, $0.001, 8 links → 5 specific + 1 document-wide, 1 refuted.
 
 Jev runs through OpenRouter (`POST https://openrouter.ai/api/alpha/decisions`, `typesafe/jev-1.13`, same request
 shape, same $0.042/1M; it is not in OpenRouter's `/models` list). `KB_JEV_ROUTE=cloudflare` switches to the gateway.
@@ -58,6 +65,9 @@ shape, same $0.042/1M; it is not in OpenRouter's `/models` list). `KB_JEV_ROUTE=
 - **A document-wide fact lives on the document**: an entity on ≥50% of a document's passages (4+) is ONE
   `SourceDocument -MENTIONS-> Entity` link (`by: "consolidated"`); `--entity` filters look at both levels.
 - **A link passes twice**: `kb confirm` re-judges every link in a focused request; the mean of the two readings must be ≥ 0.9.
+- **About, not just named**: the second reading also asks whether the passage is ABOUT the entity (`about ≥ 0.4`).
+  Famous names dropped in passing ("everything you'd learn from Harvard", "a blend of Robert Redford or Robert Goulet")
+  score 0.9+ on "discusses" twice over and 0.06-0.40 here; tracklist items and real subjects stay high.
 
 ## Rules that came out of measuring (do not undo without re-measuring)
 
@@ -130,7 +140,8 @@ Full restore: `backup/helix-volume-2026-09-20-preprune.tgz` is the whole Helix v
 | 2026-09-20 | confirm: every link judged twice, mean ≥0.9 ($0.88): −22,888 | 51,605 | 15,095 |
 | 2026-09-20 | resolve: same name = one node (1,380 pairs) + 101 Jev-confirmed aliases → 1,216 merges | 46,857 | 13,622 |
 | 2026-09-20 | **dedupe: 1,270 documents were 100% passage-for-passage copies** (old "recovered" store) → 2,659 docs · 17,028 passages | 30,772 | 13,622 |
-| 2026-09-20 | prune 3,221 orphan entities; relate: 4,613 pairs judged ($0.42) → 332 RELATES_TO, 290 EXTENDS, 4 UPDATES; 2,634 entity associations; owner + profile + 10 category parents | 30,772 | ~10,400 |
+| 2026-09-20 | **about-test** on every link ($0.58): −9,780 (7,704 only mentioned in passing, 3,539 failing the mean) → 20,992 | 20,992 | ~10,400 |
+| 2026-09-20 | (before that) prune 3,221 orphan entities; relate: 4,613 pairs judged ($0.42) → 332 RELATES_TO, 290 EXTENDS, 4 UPDATES; 2,634 entity associations; owner + profile + 10 category parents | 30,772 | ~10,400 |
 
 Search eval (graph-reached passages; grading method changed on 09-20 to one passage per request, so compare each
 run's `graph` to its own `next`): 09-19 0.51 vs 0.67 · 09-20 (220k links) 0.63 vs 0.67, 61 fresh · 09-20 (74k links)
@@ -140,12 +151,18 @@ Latency of the graph step is inside Jev-rerank noise: timed idle, a search took 
 without it on the same queries; the eval's per-query "added latency" column is not reliable while anything else runs.
 `kb check` passes: 0 unjudged, 0 under the floor, 0 unchecked LLM links, 0 orphans; 1.8 links per passage.
 
+## Audit (Claude, 2026-09-20, 40 random links of the 30,772-link graph, read by hand)
+
+30 hold · 6 are passing mentions (Harvard, Slack, Prague, Robert Goulet, Truett Cathy, the generic phrase "money
+models") · 4 could not be judged because the sample file truncated passages (fixed: `kb audit` now writes whole
+passages with edge and chunk ids). Those 6 all scored 0.92-0.97 on "discusses" — the reason the `about` test exists.
+`backup/experiment-passing-mentions.ts`: with `about ≥ 0.4`, 27/30 good links kept, 20/20 tracklist links kept, 2/6
+passing kept. Not yet re-audited after the about-test was applied.
+
 ## Open
 
-1. Ingest does not yet apply the hygiene rules to a new document (copy check by passage hash, second Jev reading,
-   document-wide consolidation, crosslinks for its passages). Until it does, run the runbook after a bulk ingest.
-2. No independent (Claude / sol) audit of a link sample has been done on the final graph.
-3. Ranking ignores the graph; a boost for hits sharing entities with other top hits is untested.
-4. 53 documents are 80-99% copies of another; 4,042 entities are held by one passage; the in-memory pool is untimed.
-5. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
-
+1. Re-audit a fresh sample of the 20,992-link graph (Claude or sol, from `kb audit`).
+2. Ranking: `--graph-rank` is experimental; result of `eval-rank.ts` is in `eval.history.jsonl`.
+3. 53 documents are 80-99% copies of another; ~4k entities are held by one passage; the in-memory pool is untimed.
+4. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
+5. After this round of cuts the hygiene commands need a fresh `kb backup`; orphan entities have not been re-pruned.

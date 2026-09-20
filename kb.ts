@@ -40,7 +40,7 @@ const LINK_VERSION = 4;   // 4 = candidate names only in questions, 6 passages a
 // passages worse and up to 40x slower (eval.ts); and with one passage per request an independent LLM agrees with 54% of
 // Jev's links at 0.80-0.85, 80% at 0.85-0.90, 84% at 0.90-0.95, 96% at 0.95+ (kb audit, 2026-09-20) → 0.85.
 const DEDUPE_SHARE = Number(process.env.KB_DEDUPE_SHARE ?? 1);   // 1 = every passage of the copy exists in the kept document: nothing unique is lost
-const MENTION_FLOOR = 0.9, WORTHY_FLOOR = 0.4, TOPIC_FLOOR = 0.8;   // example set 0.9 on 2026-09-20
+const MENTION_FLOOR = 0.9, WORTHY_FLOOR = 0.4, TOPIC_FLOOR = 0.8, ABOUT_FLOOR = 0.4;   // 0.5 also dropped real definitions ("Mamba is a selective state-space model…" 0.47); passing mentions sit at 0.06-0.40   // example set 0.9 on 2026-09-20
 
 const client = Client.server(HELIX);
 const tenantScope = Predicate.eq("tenant_id", TENANT);
@@ -235,7 +235,7 @@ async function bootstrap() {
     ["chunk_salience", IndexSpec.nodeRange("Chunk", "salience")],
     ["chunk_vec", IndexSpec.nodeVector("Chunk", "embedding", DIMS, VectorDistanceMetric.Cosine, "tenant_id")],
     ["chunk_txt", IndexSpec.nodeText("Chunk", "content", "tenant_id")],
-    ["chunk_naming", IndexSpec.nodeEquality("Chunk", "needsNaming")],
+    ["chunk_naming", IndexSpec.nodeEquality("Chunk", "needsNaming")], ["chunk_hash", IndexSpec.nodeEquality("Chunk", "contentHash")],
     ["cat_key", IndexSpec.nodeUniqueEquality("Category", "categoryKey")], ["ent_key", IndexSpec.nodeEquality("Entity", "entityKey")],
   ];
   let batch: any = writeBatch();
@@ -538,18 +538,23 @@ const VET_DEFINITIONS = {
   node_worthy: "the name identifies one particular thing: a person (a first name alone is fine), an organisation, a product, a project, a place, an event, or a concept that has a recognised name of its own (such as 'value-based pricing', 'AEO', 'virtual assistant'). Obscure or private things count. NOT node_worthy: a descriptive phrase that merely summarises what the passage says (such as 'creating a diverse population', 'three phase approach', 'learning from mistakes')",
 };
 // Every proposed name, judged in the passage it came from: is it really discussed there, and does it deserve a node?
-async function vetNames(proposals: Proposal[]): Promise<Map<string, { discusses: number; worthy: number }>> {
+// `about` is the test for famous names dropped in passing ("everything you'd learn from Harvard", "a blend of Robert
+// Redford or Robert Goulet"): Jev scores those 0.9+ on `discusses` twice over, and 0.06-0.4 here, while tracklist items
+// and real subjects stay high (backup/experiment-passing-mentions.ts, 36 hand-labelled links + 20 tracklist links).
+const ABOUT = (name: string, p: number) => `${name} is one of the things p${p} is about — not merely a name used as an example, a comparison, a simile, or a tool mentioned on the way. (When the passage is itself a tracklist, line-up, participant list or bibliography, each item on it counts as something the passage is about.)`;
+async function vetNames(proposals: Proposal[]): Promise<Map<string, { discusses: number; worthy: number; about: number }>> {
   const packs: Proposal[][] = [];   // names are only ever in the questions, so passages can share a request (see linkChunks)
   for (let start = 0; start < proposals.length; start += PACK) packs.push(proposals.slice(start, start + PACK));
-  const verdicts = new Map<string, { discusses: number; worthy: number }>();
+  const verdicts = new Map<string, { discusses: number; worthy: number; about: number }>();
   await Promise.all(packs.filter((pack) => pack.length).map(async (pack) => {
     const questions: Record<string, Question> = {};
     pack.forEach((proposal, p) => proposal.names.forEach((name, n) => {
       questions[`p${p}_d${n}`] = noul(`p${p} discusses ${name}`);
       questions[`p${p}_w${n}`] = noul(`"${name}", as used in p${p}, is node_worthy`);
+      questions[`p${p}_a${n}`] = noul(ABOUT(name, p));
     }));
     const answers = await jev({ definitions: VET_DEFINITIONS, passages: Object.fromEntries(pack.map((proposal, p) => [`p${p}`, { document: proposal.title, text: proposal.content }])) }, questions);
-    pack.forEach((proposal, p) => proposal.names.forEach((name, n) => verdicts.set(`${proposal.chunkId}\u0000${name}`, { discusses: answers[`p${p}_d${n}`]?.noul ?? 0, worthy: answers[`p${p}_w${n}`]?.noul ?? 0 })));
+    pack.forEach((proposal, p) => proposal.names.forEach((name, n) => verdicts.set(`${proposal.chunkId}\u0000${name}`, { discusses: answers[`p${p}_d${n}`]?.noul ?? 0, worthy: answers[`p${p}_w${n}`]?.noul ?? 0, about: answers[`p${p}_a${n}`]?.noul ?? 0 })));
   }));
   return verdicts;
 }
@@ -616,7 +621,7 @@ Most passages add zero to three names; when in doubt leave it out — a rejected
       perChunk.set(chunkId, keys.filter((key) => {
         const verdict = verdicts.get(`${chunkId}\u0000${named.get(key)!.name}`);
         const worthyFloor = named.get(key)!.kind === "topic" ? TOPIC_FLOOR : WORTHY_FLOOR;
-        if (!verdict || verdict.discusses < MENTION_FLOOR || verdict.worthy < worthyFloor) {
+        if (!verdict || verdict.discusses < MENTION_FLOOR || verdict.worthy < worthyFloor || verdict.about < ABOUT_FLOOR) {
           if (verdict && verdict.discusses < MENTION_FLOOR) stats.notDiscussed = (stats.notDiscussed ?? 0) + 1;
           if (verdict && verdict.worthy < worthyFloor) stats.notWorthy = (stats.notWorthy ?? 0) + 1;
           return false;
@@ -688,6 +693,77 @@ function chunksOf(text: string): string[] {
 }
 
 
+// identical text, not similar text: whitespace collapsed, then hashed
+const passageHash = (text: string) => createHash("sha256").update(text.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 32);
+
+// Everything the corpus-wide hygiene commands do, for ONE freshly linked document, read live — so a new document enters
+// the graph already clean: (1) every link gets its second reading (mean of two >= floor, and the passage must be ABOUT
+// it); (2) an entity on at least half of its passages moves to one document link; (3) its passages are crosslinked to
+// passages of other documents that share two or more walkable entities, typed by Jev.
+async function settleDocument(documentId: string, stats: LinkStats) {
+  const links = (await read<{ rows: EdgeRow[] | null }>(readBatch().varAs("rows", chunksOfDocument(documentId).outE("MENTIONS").valueMap(["$id", "$from", "$to", "confidence", "by", "entityKey"])).returning(["rows"]), "settle_links")).rows ?? [];
+  if (!links.length) return;
+  const passages = (await read<{ rows: any[] | null }>(readBatch().varAs("rows", chunksOfDocument(documentId).project([PropertyProjection.renamed("$id", "id"), ...fields("chunkId", "title", "content")])).returning(["rows"]), "settle_passages")).rows ?? [];
+  const names = new Map<number, EntityRow>();
+  const ids = [...new Set(links.map((edge) => edge.$to))];
+  for (let start = 0; start < ids.length; start += 500) for (const row of (await read<{ rows: EntityRow[] | null }>(readBatch().varAs("rows", g().n(ids.slice(start, start + 500)).valueMap(["$id", "entityKey", "name", "kind"])).returning(["rows"]), "settle_entities")).rows ?? []) names.set(row.$id, row);
+  // (1) second reading
+  const byChunk = new Map<number, EdgeRow[]>();
+  for (const edge of links) if (names.has(edge.$to)) byChunk.set(edge.$from, [...(byChunk.get(edge.$from) ?? []), edge]);
+  const verdicts = await vetNames(passages.filter((row) => byChunk.has(Number(row.id))).map((row) => ({ chunkId: row.chunkId, title: row.title ?? "", content: row.content, names: byChunk.get(Number(row.id))!.map((edge) => names.get(edge.$to)!.name) })));
+  const chunkIdOf = new Map(passages.map((row) => [Number(row.id), row.chunkId as string]));
+  const refuted = links.filter((edge) => { const verdict = verdicts.get(`${chunkIdOf.get(edge.$from)}\u0000${names.get(edge.$to)?.name}`); return !verdict || (edge.confidence + verdict.discusses) / 2 < MENTION_FLOOR || verdict.about < ABOUT_FLOOR; });
+  const gone = new Set(refuted.map((edge) => edge.$id)), standing = links.filter((edge) => !gone.has(edge.$id));
+  // (2) document-wide facts
+  const per = new Map<number, EdgeRow[]>();
+  for (const edge of standing) per.set(edge.$to, [...(per.get(edge.$to) ?? []), edge]);
+  const wide = passages.length >= 4 ? [...per].filter(([, edges]) => edges.length / passages.length >= 0.5) : [];
+  let batch: any = writeBatch().varAs("document", documentById(documentId).limit(1));
+  wide.forEach(([entity, edges], index) => {
+    batch = batch.varAs(`h${index}`, g().n(NodeRef.var("document")).outE("MENTIONS").where(Predicate.eq("entityKey", names.get(entity)!.entityKey)))
+      .varAsIf(`a${index}`, BatchCondition.varEmpty(`h${index}`), g().n(NodeRef.var("document")).addE("MENTIONS", entity, { tenant_id: TENANT, entityKey: names.get(entity)!.entityKey, confidence: Math.max(...edges.map((edge) => edge.confidence)), by: "consolidated", passages: edges.length }));
+    for (const edge of edges) gone.add(edge.$id);
+  });
+  if (gone.size) batch = batch.varAs("dropped", g().dropEdgeById([...gone]));
+  await write(batch.returning([]), "settle_document");
+  stats.mentions -= gone.size;
+  // (3) crosslinks
+  const specific = links.filter((edge) => !gone.has(edge.$id)), mine = new Set(passages.map((row) => Number(row.id)));
+  const targets = [...new Set(specific.map((edge) => edge.$to))];
+  const partners = new Map<string, { weight: number; via: string[] }>();
+  for (let start = 0; start < targets.length; start += 40) {
+    let reach: any = readBatch();
+    targets.slice(start, start + 40).forEach((entity, index) => { reach = reach.varAs(`r${index}`, g().n(entity).in("MENTIONS").hasLabel("Chunk").limit(HUB + 1).project([PropertyProjection.renamed("$id", "id")])); });
+    const held = await read<Record<string, { id: number }[] | null>>(reach.returning(targets.slice(start, start + 40).map((_, index) => `r${index}`)), "settle_reach");
+    targets.slice(start, start + 40).forEach((entity, index) => {
+      const holders = (held[`r${index}`] ?? []).map((row) => Number(row.id));
+      if (holders.length < 2 || holders.length > HUB) return;
+      for (const edge of specific.filter((link) => link.$to === entity)) for (const other of holders) if (!mine.has(other)) {
+        const key = `${edge.$from}>${other}`, entry = partners.get(key) ?? { weight: 0, via: [] };
+        entry.weight += 1 / Math.log2(1 + holders.length); entry.via.push(names.get(entity)!.name); partners.set(key, entry);
+      }
+    });
+  }
+  const best = new Map<number, [string, number][]>();
+  for (const [key, entry] of partners) if (entry.via.length >= 2) { const from = Number(key.split(">")[0]); best.set(from, [...(best.get(from) ?? []), [key, entry.weight]]); }
+  const candidates = [...best.values()].flatMap((list) => list.sort((x, y) => y[1] - x[1]).slice(0, 3).map(([key]) => key));
+  let crosslinks = 0;
+  await pool(candidates, JEV_IN_FLIGHT, async (key) => {
+    const [a, b] = key.split(">").map(Number);
+    const data = await read<{ chunks: any[] | null }>(readBatch().varAs("chunks", g().n([a, b]).project([PropertyProjection.renamed("$id", "id"), ...fields("title", "content", "documentId")])).returning(["chunks"]), "settle_pair");
+    const of = new Map((data.chunks ?? []).map((chunk) => [Number(chunk.id), chunk]));
+    if (!of.get(a) || !of.get(b)) return;
+    const answers = await jev({ a: `${of.get(a).title}\n${of.get(a).content}`, b: `${of.get(b).title}\n${of.get(b).content}` }, {
+      related: noul("passages a and b are about the same specific matter — the same deal, person's situation, product decision, technique or idea — so that someone reading one should be pointed to the other. Sharing a broad theme is not enough"),
+      type: choice("How passages a and b relate", { same_event: "two records of the very same meeting, call, talk or document", a_is_newer: "a states a later version of facts, plans or decisions that b also states", b_is_newer: "b states a later version of facts, plans or decisions that a also states", related: "about the same specific matter, but none of the above" }) });
+    if ((answers.related?.noul ?? 0) < MENTION_FLOOR) return;
+    const type = answers.type?.choice ?? "related", [label, from, to] = type === "a_is_newer" ? ["UPDATES", a, b] : type === "b_is_newer" ? ["UPDATES", b, a] : type === "same_event" ? ["EXTENDS", a, b] : ["RELATES_TO", a, b];
+    await write(writeBatch().varAs("edge", g().n(from).addE(label, to, { tenant_id: TENANT, confidence: answers.related!.noul!, via: partners.get(key)!.via, by: "jev" })).returning([]), "settle_crosslink");
+    crosslinks++;
+  });
+  console.log(`   settled ${documentId}: ${links.length} links → ${links.length - gone.size} specific + ${wide.length} document-wide · ${refuted.length} refuted on second reading · ${crosslinks} crosslinks`);
+}
+
 type SourceJson = { id?: string; customId?: string; title?: string; content?: string; raw?: string; source?: string; url?: string; metadata?: Record<string, any> };
 
 async function ingestOne(dir: string, filename: string, kindOverride: string | null, replace: boolean, categories: Category[], stats: LinkStats): Promise<string> {
@@ -702,11 +778,18 @@ async function ingestOne(dir: string, filename: string, kindOverride: string | n
     const existing = await read<{ found: unknown[] | null }>(readBatch().varAs("found", documentById(documentId).limit(1).project(fields("documentId"))).returning(["found"]), "document_exists");
     if (existing.found?.length) return "exists";
   }
-  const chunks = chunksOf(text), vectors = await embed(chunks);
+  const chunks = chunksOf(text), hashes = chunks.map(passageHash);
+  // the same document under another id is not a new document (a third of the corpus once was exactly that)
+  const twins = (await read<{ rows: { documentId: string; contentHash: string }[] | null }>(readBatch().varAs("rows", g().nWithLabelWhere("Chunk", Predicate.isIn("contentHash", [...new Set(hashes)])).where(tenantScope).project(fields("documentId", "contentHash"))).returning(["rows"]), "copy_check")).rows ?? [];
+  const covered = new Map<string, Set<string>>();
+  for (const row of twins) if (row.documentId !== documentId) (covered.get(row.documentId) ?? covered.set(row.documentId, new Set()).get(row.documentId)!).add(row.contentHash);
+  const twin = [...covered].find(([, seen]) => new Set(hashes).size === seen.size);
+  if (twin) { console.log(`${documentId.padEnd(22)} copy of ${twin[0]} — skipped`); return "copy"; }
+  const vectors = await embed(chunks);
   const addChunk = (into: any, index: number) => into
     .varAs(`c${index}`, g().addN("Chunk", {
       tenant_id: TENANT, userId: USER, chunkId: `${documentId}:${index}`, documentId, title, chunkIndex: index, ordinal: index, documentKind: kind, source: sourceName,
-      content: chunks[index], embedding: PropertyValue.f32Array(vectors[index]), embeddingModel: `openai:${EMBED_MODEL}`, createdAt: Expr.datetime(),
+      content: chunks[index], contentHash: hashes[index], embedding: PropertyValue.f32Array(vectors[index]), embeddingModel: `openai:${EMBED_MODEL}`, createdAt: Expr.datetime(),
     }))
     .varAs(`h${index}`, g().n(NodeRef.var("document")).addE("HAS_CHUNK", NodeRef.var(`c${index}`), { tenant_id: TENANT, ordinal: index }));
   let batch: any = writeBatch();
@@ -728,6 +811,7 @@ async function ingestOne(dir: string, filename: string, kindOverride: string | n
   await linkChunks(ids, docOf, categories, stats);
   const flagged = await read<{ chunks: { chunkId: string }[] | null }>(readBatch().varAs("chunks", g().nWithLabelWhere("Chunk", Predicate.and([Predicate.eq("documentId", documentId), Predicate.eq("needsNaming", true)])).where(tenantScope).project(fields("chunkId"))).returning(["chunks"]), "flagged_in_document");
   if (flagged.chunks?.length) await nameChunks(flagged.chunks.map((row) => row.chunkId), docOf, stats);
+  await settleDocument(documentId, stats);
   console.log(`${documentId.padEnd(22)} ${String(chunks.length).padStart(3)} chunks  ${title.slice(0, 70)}`);
   return "ok";
 }
@@ -751,7 +835,7 @@ async function ingest(args: Args) {
 
 type Args = { positional: string[]; values: (name: string) => string[]; has: (name: string) => boolean; number: (name: string, fallback: number) => number };
 
-const BOOLEAN_FLAGS = new Set(["--replace", "--all-entities", "--chunks", "--full", "--no-graph", "--no-rerank", "--json", "--dry-run", "--redo", "--seed", "--resolve", "--mine", "--with-boilerplate", "--yes"]);
+const BOOLEAN_FLAGS = new Set(["--graph-rank", "--replace", "--all-entities", "--chunks", "--full", "--no-graph", "--no-rerank", "--json", "--dry-run", "--redo", "--seed", "--resolve", "--mine", "--with-boilerplate", "--yes"]);
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [], flags = new Map<string, string[]>();
   for (let index = 0; index < argv.length; index++) {
@@ -874,6 +958,18 @@ async function search(args: Args) {
       if (entry.relevance !== undefined) entry.score = entry.relevance + 0.2 * entry.score;
     }));
     ranked = [...pool.sort((a, b) => b.score - a.score), ...ranked.slice(pool.length)];
+  }
+  // --graph-rank (experimental, measured by eval-rank.ts): a hit that shares specific entities with the other leading hits
+  // is corroborated by the graph and moves up a little.
+  if (args.has("--graph-rank") && ranked.length > 1) {
+    const lead = ranked.slice(0, Math.max(top * 2, 12));
+    let batch: any = readBatch();
+    lead.forEach((entry, index) => { batch = batch.varAs(`e${index}`, g().n(entry.hit.id).out("MENTIONS").project([PropertyProjection.renamed("$id", "id")])); });
+    const held = await read<Record<string, { id: number }[] | null>>(batch.returning(lead.map((_, index) => `e${index}`)), "graph_rank");
+    const sets = lead.map((_, index) => new Set((held[`e${index}`] ?? []).map((row) => Number(row.id)))), seen = new Map<number, number>();
+    for (const set of sets) for (const id of set) seen.set(id, (seen.get(id) ?? 0) + 1);
+    lead.forEach((entry, index) => { const corroborated = [...sets[index]].filter((id) => seen.get(id)! >= 2 && seen.get(id)! <= lead.length / 2).length; entry.score += 0.05 * Math.min(3, corroborated); });
+    ranked = [...lead.sort((a, b) => b.score - a.score), ...ranked.slice(lead.length)];
   }
   if (!args.has("--chunks")) {
     const perDocument = new Map<string, Ranked>();
@@ -1307,7 +1403,7 @@ async function confirm(args: Args) {
   const dir = latestBackup(args), log = join(dir, "confirm.jsonl");
   const entities = new Map(jsonl<EntityRow>(join(dir, "entities.jsonl")).map((entity) => [entity.$id, entity]));
   const standing = standingLinks(dir).filter((edge) => entities.has(edge.$to));
-  const done = new Map(jsonl<{ edge: number; again: number }>(log).map((row) => [row.edge, row.again]));
+  const done = new Map(jsonl<{ edge: number; again: number; about?: number }>(log).filter((row) => row.about !== undefined).map((row) => [row.edge, row.again]));
   const byChunk = new Map<number, EdgeRow[]>();
   for (const edge of standing) if (!done.has(edge.$id)) byChunk.set(edge.$from, [...(byChunk.get(edge.$from) ?? []), edge]);
   let chunkIds = [...byChunk.keys()];
@@ -1320,19 +1416,20 @@ async function confirm(args: Args) {
     const data = await read<{ chunks: any[] | null }>(readBatch().varAs("chunks", g().n(page).project([PropertyProjection.renamed("$id", "id"), ...fields("chunkId", "title", "content")])).returning(["chunks"]), "passages_to_confirm");
     const proposals = (data.chunks ?? []).filter((chunk) => chunk.content?.trim()).map((chunk) => ({ chunk, edges: byChunk.get(Number(chunk.id)) ?? [] }));
     const verdicts = await vetNames(proposals.map(({ chunk, edges }) => ({ chunkId: chunk.chunkId, title: chunk.title ?? "", content: chunk.content, names: edges.map((edge) => entities.get(edge.$to)!.name) })));
-    const rows = proposals.flatMap(({ chunk, edges }) => edges.map((edge) => ({ edge: edge.$id, entity: edge.$to, name: entities.get(edge.$to)!.name, first: edge.confidence, again: verdicts.get(`${chunk.chunkId}\u0000${entities.get(edge.$to)!.name}`)?.discusses ?? 0 })));
+    const rows = proposals.flatMap(({ chunk, edges }) => edges.map((edge) => ({ edge: edge.$id, entity: edge.$to, name: entities.get(edge.$to)!.name, first: edge.confidence, again: verdicts.get(`${chunk.chunkId}\u0000${entities.get(edge.$to)!.name}`)?.discusses ?? 0, about: verdicts.get(`${chunk.chunkId}\u0000${entities.get(edge.$to)!.name}`)?.about ?? 0 })));
     if (rows.length) appendFileSync(log, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
     read_ += proposals.length;
     console.log(`[${new Date().toTimeString().slice(0, 8)}] ${read_}/${chunkIds.length} passages · ${usage.jevCalls} jev`);
   });
   if (usage.jevCalls) console.log(`jev: ${usage.jevCalls} calls, ${usage.jevTokens} tokens ≈ $${(usage.jevTokens * 0.042 / 1e6).toFixed(3)}`);
-  const verdict = new Map(jsonl<{ edge: number; again: number }>(log).map((row) => [row.edge, row.again]));
+  const readings = jsonl<{ edge: number; again: number; about?: number }>(log).filter((row) => row.about !== undefined);
+  const verdict = new Map(readings.map((row) => [row.edge, row.again])), aboutOf = new Map(readings.map((row) => [row.edge, row.about!]));
   // two independent readings, averaged: a 0.95 then 0.88 is one solid link seen through noise; a 0.93 then 0.46 is not
   const mean = (edge: EdgeRow) => (edge.confidence + verdict.get(edge.$id)!) / 2;
-  const judged = standing.filter((edge) => verdict.has(edge.$id)), refuted = judged.filter((edge) => mean(edge) < MENTION_FLOOR);
+  const judged = standing.filter((edge) => verdict.has(edge.$id)), refuted = judged.filter((edge) => mean(edge) < MENTION_FLOOR || aboutOf.get(edge.$id)! < ABOUT_FLOOR);
   const byKind: Record<string, [number, number]> = {};
-  for (const edge of judged) { const kind = entities.get(edge.$to)!.kind; byKind[kind] ??= [0, 0]; byKind[kind][0]++; if (mean(edge) < MENTION_FLOOR) byKind[kind][1]++; }
-  console.log(`${judged.length} links judged a second time · ${judged.length - refuted.length} confirmed · ${refuted.length} refuted (${Math.round(100 * refuted.length / Math.max(1, judged.length))}%)`);
+  for (const edge of judged) { const kind = entities.get(edge.$to)!.kind; byKind[kind] ??= [0, 0]; byKind[kind][0]++; if (mean(edge) < MENTION_FLOOR || aboutOf.get(edge.$id)! < ABOUT_FLOOR) byKind[kind][1]++; }
+  console.log(`${judged.length} links judged a second time · ${judged.length - refuted.length} confirmed · ${refuted.length} refuted (${Math.round(100 * refuted.length / Math.max(1, judged.length))}%) — ${judged.filter((edge) => mean(edge) < MENTION_FLOOR).length} not discussed on average, ${judged.filter((edge) => aboutOf.get(edge.$id)! < ABOUT_FLOOR).length} only mentioned in passing`);
   for (const [kind, [total, gone]] of Object.entries(byKind)) console.log(`   ${kind.padEnd(13)} ${total} → ${total - gone}`);
   if (!args.has("--yes")) return console.log("dry run — add --yes to drop the refuted links");
   await dropEdges(refuted.map((edge) => edge.$id), "confirm_refuted_links");
@@ -1500,7 +1597,7 @@ async function audit(args: Args) {
   const file = join(BACKUPS, `audit-sample-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.jsonl`);
   writeFileSync(file, sample.map((edge, index) => {
     const entity = entities.get(edge.$to)!, text = (textOf.get(edge.$from) ?? "").replace(/\s+/g, " "), at = text.toLowerCase().indexOf(entity.name.toLowerCase());
-    return JSON.stringify({ n: index, name: entity.name, kind: entity.kind, confidence: edge.confidence, by: edge.by, verbatim: at >= 0, around: at >= 0 ? text.slice(Math.max(0, at - 300), at + entity.name.length + 300) : "", passage: text.slice(0, 1800) });
+    return JSON.stringify({ n: index, edge: edge.$id, chunk: edge.$from, name: entity.name, kind: entity.kind, confidence: edge.confidence, by: edge.by, verbatim: at >= 0, around: at >= 0 ? text.slice(Math.max(0, at - 300), at + entity.name.length + 300) : "", passage: text });   // the whole passage: a reviewer cannot judge what it cannot see
   }).join("\n") + "\n");
   console.log(`${sample.length} links sampled from ${links.length} → ${file}`);
 }
@@ -1639,6 +1736,20 @@ try {
     case "relate": await relate(args); break;
     case "dedupe": await dedupe(args); break;
     case "model": await model(args); break;
+    case "hashes": {   // one-off: give every existing passage its contentHash so ingest can recognise copies
+      await bootstrap();
+      const rows = (await read<{ rows: { id: number; contentHash?: string }[] | null }>(readBatch().varAs("rows", g().nWithLabel("Chunk").where(tenantScope).project([PropertyProjection.renamed("$id", "id"), ...fields("contentHash")])).returning(["rows"]), "hash_state")).rows ?? [];
+      const missing = rows.filter((row) => !row.contentHash).map((row) => Number(row.id));
+      console.log(`${rows.length} passages · ${missing.length} without a contentHash`);
+      for (let start = 0; start < missing.length; start += 300) {
+        const texts = (await read<{ rows: { id: number; content: string }[] | null }>(readBatch().varAs("rows", g().n(missing.slice(start, start + 300)).project([PropertyProjection.renamed("$id", "id"), ...fields("content")])).returning(["rows"]), "hash_texts")).rows ?? [];
+        let batch: any = writeBatch();
+        texts.forEach((row, index) => { batch = batch.varAs(`h${index}`, g().n(Number(row.id)).setProperty("contentHash", passageHash(row.content ?? ""))); });
+        await write(batch.returning([]), "hash_backfill");
+        console.log(`  ${Math.min(missing.length, start + 300)}/${missing.length}`);
+      }
+      break;
+    }
     case "profile": { const data = await read<{ rows: any[] | null }>(readBatch().varAs("rows", g().nWithLabel("UserProfile").where(tenantScope).project(fields("static", "dynamic", "updatedAt"))).returning(["rows"]), "profile"); const profile = data.rows?.[0]; if (!profile) throw new Error("no profile — run `kb model --yes`"); console.log(`STATIC\n${profile.static.map((line: string) => `  - ${line}`).join("\n")}\n\nCURRENT\n${profile.dynamic.map((line: string) => `  - ${line}`).join("\n")}`); break; }
     case "consolidate": await consolidate(args); break;
     case "check": await check(); break;
