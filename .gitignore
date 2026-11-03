@@ -34,7 +34,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 # kb: backups hold private corpus text, logs are noise
-backup/*
-!backup/experiment-*.ts
+backup/
+data/
+eval.history.jsonl
+config.local.sh
 *.log
 .impeccable

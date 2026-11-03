@@ -1,0 +1,11 @@
+{
+  "id": "demo:greenhouse-irrigation",
+  "title": "Greenhouse irrigation",
+  "content": "Cedar Garden uses drip irrigation for its greenhouse tomatoes. Rainwater from the covered tank flows through a sediment filter before reaching the drip lines. Soil moisture sensors help the gardener adjust the watering schedule.",
+  "source": "synthetic",
+  "url": "https://example.invalid/greenhouse-irrigation",
+  "metadata": {
+    "kind": "note",
+    "source": "synthetic"
+  }
+}

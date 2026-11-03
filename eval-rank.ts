@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
-// Does --graph-rank improve the top 8? Same 20 queries as eval.ts, Jev grades one passage per request.
+// Does --graph-rank improve the top 8? Same queries as eval.ts, Jev grades one passage per request.
 import { readFileSync, appendFileSync } from "node:fs"; import { join } from "node:path";
 const QUERIES = (readFileSync(join(import.meta.dir, "eval.ts"), "utf8").match(/const QUERIES = \[([\s\S]*?)\];/)![1].match(/"[^"]+"/g)!).map((q) => JSON.parse(q));
-const key = JSON.parse(readFileSync("/home/user/.pi/agent/auth.json", "utf8")).openrouter.key;
-async function grade(query: string, passage: string) { for (let a = 0; ; a++) { const r: any = await fetch("https://openrouter.ai/api/alpha/decisions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: "typesafe/jev-1.13", state: { request: query, passage }, questions: { useful: { type: "noul", instructions: "The passage answers the request or contains information directly useful for it" } } }) }).catch(() => ({ ok: false })); if (r.ok) return ((await r.json()) as any).answers.useful.noul as number; if (a === 8) return 0; await Bun.sleep(2000 * (a + 1)); } }
+const key = process.env.OPENROUTER_API_KEY;
+if (!key) throw new Error("set OPENROUTER_API_KEY");
+async function grade(query: string, passage: string) { for (let a = 0; ; a++) { const r: any = await fetch(process.env.KB_JEV_URL ?? "https://openrouter.ai/api/alpha/decisions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: "typesafe/jev-1.13", state: { request: query, passage }, questions: { useful: { type: "noul", instructions: "The passage answers the request or contains information directly useful for it" } } }) }).catch(() => ({ ok: false })); if (r.ok) return ((await r.json()) as any).answers.useful.noul as number; if (a === 8) return 0; await Bun.sleep(2000 * (a + 1)); } }
 async function top8(query: string, flags: string[]) { const run = Bun.spawn(["bun", join(import.meta.dir, "kb.ts"), "search", query, "--json", "--chunks", "--no-graph", "--top", "8", ...flags], { stdout: "pipe", stderr: "ignore" }); return JSON.parse(await new Response(run.stdout).text()).hits.map((e: any) => e.hit) as any[]; }
 const cache = new Map<string, number>(); const g = async (q: string, h: any) => { const k = `${q}|${h.chunkId}`; if (!cache.has(k)) cache.set(k, await grade(q, h.content)); return cache.get(k)!; };
 let plain = 0, boosted = 0, changed = 0, n = 0;

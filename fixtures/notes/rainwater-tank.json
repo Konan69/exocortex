@@ -1,0 +1,11 @@
+{
+  "id": "demo:rainwater-tank",
+  "title": "Rainwater tank",
+  "content": "Cedar Garden collects rainwater from the greenhouse roof in a covered tank. A mesh filter catches leaves before water reaches the tank. The irrigation pump sends stored water to the tomato beds.",
+  "source": "synthetic",
+  "url": "https://example.invalid/rainwater-tank",
+  "metadata": {
+    "kind": "note",
+    "source": "synthetic"
+  }
+}

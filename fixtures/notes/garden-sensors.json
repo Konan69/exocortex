@@ -1,0 +1,11 @@
+{
+  "id": "demo:garden-sensors",
+  "title": "Garden sensors",
+  "content": "Cedar Garden monitors the solar greenhouse with temperature and soil moisture sensors. A local controller records sensor readings every hour. The irrigation pump runs only when soil moisture falls below its target.",
+  "source": "synthetic",
+  "url": "https://example.invalid/garden-sensors",
+  "metadata": {
+    "kind": "note",
+    "source": "synthetic"
+  }
+}

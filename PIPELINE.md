@@ -1,6 +1,7 @@
 # kb — the high-quality graph pipeline
 
-One tool: `~/projects/kb/kb.ts` (bun, `@helix-db/helix-db` v3). Helix v4 on `localhost:6972`, tenant `example`.
+One tool: `kb.ts` (Bun, `@helix-db/helix-db` v3). Set `HELIX_URL` to your own running Helix instance.
+The CLI never starts containers. See `config.example.sh` for environment configuration.
 This file is the design, the numbers behind it, and the runbook. `kb` with no arguments prints usage.
 
 ## Shape
@@ -15,7 +16,7 @@ Chunk props (Jev): category, salience, aboutOwner, boilerplate, needsNaming, lin
 
 ### Helix's memory-system model, and where each piece stands here
 
-The unit of knowledge is the **Chunk** (atomic `Memory` nodes were built, then dropped on example's call, 2026-09-19).
+The unit of knowledge is the **Chunk**.
 
 | Helix model | Here | Built by |
 |---|---|---|
@@ -24,7 +25,7 @@ The unit of knowledge is the **Chunk** (atomic `Memory` nodes were built, then d
 | `Category`, `IN_CATEGORY`, `PARENT_OF` | 44 leaves under 10 parents (`isParent: true`; passages are only filed under leaves) | `kb taxonomy --seed`, `kb model` |
 | `RELATES_TO` (unit ↔ unit) | Chunk↔Chunk across documents: the graph proposes pairs sharing 2+ walkable entities (3 strongest per passage), Jev decides ≥0.9 | `kb relate` |
 | `EXTENDS`, `UPDATES` | Jev types each related pair: two records of one event → the fuller document's passage `EXTENDS` the other; a newer statement `UPDATES` the older | `kb model` |
-| `User`, `OWNS`, `UserProfile`, `HAS_PROFILE` | User(example) owns every document; profile = static facts + current focus, written by GLM from the densest passages Jev marked as about the owner (`kb profile` prints it) | `kb model` |
+| `User`, `OWNS`, `UserProfile`, `HAS_PROFILE` | User(owner) owns every document; profile = static facts + current focus, written by GLM from the densest passages Jev marked as about the owner (`kb profile` prints it) | `kb model` |
 | `DERIVES` | not built — nothing here is inferred from other memories | — |
 | `Session`, `DERIVED_FROM`, `Connector`, `IngestionJob` | not applicable — no chat sessions, one local tool | — |
 | *(not in Helix's model)* Entity↔Entity | `ASSOCIATED_WITH{passages, share}`: 3+ shared passages and ≥30% of the rarer entity's passages; counted, no model | `kb model` |
@@ -32,7 +33,7 @@ The unit of knowledge is the **Chunk** (atomic `Memory` nodes were built, then d
 | Who | Does | Why |
 |---|---|---|
 | Helix | stores, vector + BM25 search, proposes candidate entities from the 8 most similar passages | a bare name holds no context, so names are never embedded or compared |
-| Jev (`typesafe/jev-1.13` via OpenRouter; Cloudflare gateway `example-dev` as the alternative) | every decision: is X discussed here, category, salience, about example, boilerplate, is something unnamed, is a name node-worthy, are two names one thing, does a passage answer the query | typed answers with probabilities, $0.042 / 1M tokens, ~2 s |
+| Jev (`typesafe/jev-1.13` via OpenRouter; Cloudflare gateway configured with `KB_AI_GATEWAY` as the alternative) | every decision: is X discussed here, category, salience, about the owner, boilerplate, is something unnamed, is a name node-worthy, are two names one thing, does a passage answer the query | typed answers with probabilities, $0.042 / 1M tokens, ~2 s |
 | GLM (`z-ai/glm-5.3-flash`, OpenRouter, `reasoning: minimal`) | the only writing: names entities Jev flagged as missing, drafts the taxonomy | Jev cannot write text. (Auditing Jev's links is done by Claude or sol from `kb audit`'s sample file, not by GLM) |
 
 ## Ingest (per document, one command: `kb ingest <dir>`) — a document enters the graph already clean
@@ -53,8 +54,13 @@ The unit of knowledge is the **Chunk** (atomic `Memory` nodes were built, then d
 
 Measured on a 4-passage document: 0.4 min, $0.001, 8 links → 5 specific + 1 document-wide, 1 refuted.
 
-Jev runs through OpenRouter (`POST https://openrouter.ai/api/alpha/decisions`, `typesafe/jev-1.13`, same request
-shape, same $0.042/1M; it is not in OpenRouter's `/models` list). `KB_JEV_ROUTE=cloudflare` switches to the gateway.
+## X bookmarks (`kb bookmarks`) — cheap index, article-only graph
+
+The basic import still skips linking, naming and settling. Each non-tombstoned bookmark in Field Theory's JSONL becomes one `SourceDocument` `x:<id>` plus one `Chunk` `x:<id>:0`, kind `x_bookmark`, source `x`. Its text includes post, quote, links and up to 3,000 characters of ft SQLite `article_text`; Jev label category, `signal / 3` salience, folders and postedAt are stored on the chunk. `--replace` leaves unchanged chunks in place (including their links); if a graph-linked article's content changes, it warns to rerun `--graph --redo`.
+
+`kb bookmarks --graph [--dry-run] [--limit N] [--redo]` selects **only** source JSONL bookmarks absent from the tombstone file whose ft `article_text` exceeds 200 characters and whose chunk is indexed. It runs the normal `linkChunks` (Helix candidates → Jev, mention floor 0.9), `nameChunks` (flagged only: GLM proposes → Jev vets), then `settleDocument` for each selected article. LINK_VERSION skips previously linked chunks unless `--redo`; `--limit` caps this pass. One-line posts stay out: linking banter mints spurious entities.
+
+Bookmark-only search defaults to `--mode graph`: Helix BM25 over `EntityName.name` (plus exact entity keys) ranks up to 8 names, then equality-index mapping `entityKey → Entity` reaches passages via `Chunk ←MENTIONS Entity` and `SourceDocument ←MENTIONS Entity → HAS_CHUNK`, respecting chunk filters. Passages accumulate weight from matched entities, then graph and Chunk.content BM25 lists fuse via app-side RRF (+0.3 × salience); `via` shows `G`, `=`, or both. `expandChunks` still walks the hits. The graph holds what saved things are about; keyword catches wording with no entity. No query embeddings or Jev rerank on this path; other searches still default to hybrid. **Since 2026-10-12:** every lookup of three words or fewer takes this graph + BM25 path (a bare name gives an embedding little context); it falls back to vector only when both lists are empty. Longer queries run graph + BM25 + vector. Jev rerank is off unless `--rerank` (one model call per candidate on every search); read further with `--page N`. `kb dedupe` has a second test on running text (8-word shingles, timestamps stripped, ≥80% contained, equal-standing pairs must also agree on title) for the same text cut differently: 197 documents removed, 4096 → 3899. Explicit `--mode text|vector|hybrid` remains available. Missing EntityName BM25 is a hard error with the backfill command, not a silent contains-scan fallback.
 
 ## What an entity is (the tagging rules)
 
@@ -71,7 +77,7 @@ shape, same $0.042/1M; it is not in OpenRouter's `/models` list). `KB_JEV_ROUTE=
 
 ## Rules that came out of measuring (do not undo without re-measuring)
 
-Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jsonl`; audits in `backup/audit*.`
+The measurements below describe the original private corpus. Its data, experiments and audit files are not distributed. New eval runs append to `eval.history.jsonl`.
 
 - **Names never go in the passage state.** v2 listed each passage's candidate names inside its state object and packed
   ~13 passages a request. Jev then "found" those names: links whose name is absent from their passage scored ≥0.8 in
@@ -94,7 +100,7 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   134-216 characters; the only first passage carrying real text was 3,801, so the copy test ignores a document's
   first passage when it is under 500 characters. That found 65 documents (638 passages) whose every content passage
   already existed elsewhere, and left alone the two that differ mid-document and the blog post with a long opening.
-- **Same name = same node.** The entity key carried the kind, so "PyHarness" existed as a project and a product. Shown
+- **Same name = same node.** The entity key carried the kind, so "ExampleTool" existed as a project and a product. Shown
   the two kinds Jev calls them different (0 of 425 reached 0.9), so identical normalised names merge without asking and
   `kb name` reuses an existing name under whatever kind it has. Jev decides aliases ("RAG" = "retrieval-augmented generation").
 - **Lists are information.** "A name in a list is not discussed" stripped DJ tracklists of their artists (33 → 400
@@ -105,12 +111,12 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   the passage never says, so the whole graph was measured for it: 669 of 20,997 links (3.2%) contain no word of the
   entity's name, 336 of them topics. 37 of the non-topic ones were read by hand — **33 hold, 4 weak, 0 wrong**. The
   passage almost always *does* say the name, differently: a transcript garbles it (Gardin/Garden, school/Skool,
-  Olama/Ollama, Lyola/Loyola, Traer board/Trello, Sanwater/example, three MTT/3MTT, Sarte/Sartre), a 16th-century
-  translation spells it its own way (Romaines, Souldan, Carminiola), it is abbreviated (DDVC = DataDriven VC), the
+  Olama/Ollama, Lyola/Loyola, Traer board/Trello, Sarte/Sartre), a 16th-century
+  translation spells it its own way (Romaines, Souldan, Carminiola), it is abbreviated (DDVC = Example Research), the
   subject is named by role ("the duke" = Cesare Borgia) or is the first-person speaker of an interview. **A "the name
   must appear" rule was therefore rejected** — it would delete ~300 links, ~90% of them right, and it is exactly the
   string rule Jev exists to replace. (`experiment-absent-names.ts`; the same run showed spacing and punctuation
-  variants must be matched before calling a name absent — "VC OS" is written example.)
+  variants must be matched before calling a name absent — "Work Stream" is written Workstream.)
 - **There is no error pocket where "absent name" meets "only one passage holds it".** The obvious follow-up to the
   two findings above — that the tail of thin entities is where absent-name links go wrong — is false: the two
   conditions intersect in 29 links, 0.1% of the graph, and the names in it are the same spelling cases as everywhere
@@ -136,7 +142,7 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
   exactly equal, which is the correctness check as well as the timing one. Over 16,394 passages that is ~10 minutes
   of Helix reads against ~5, plus a 5-9 s one-off load. Reproduced twice. (`experiment-pool-timing.ts`)
 - **Throughput.** Cloudflare's gateway refuses past ~250 requests/min ("Wholesale rate limit", code 2018); OpenRouter
-  took 40 requests/s without refusing (latency climbs; ~8/s effective from Lagos). With Jev unthrottled the bound is
+  took 40 requests/s without refusing (latency climbs; ~8/s effective in the original environment). With Jev unthrottled the bound is
   Helix: one core, reads and writes share it → bulk passes use an in-memory pool (links + rosters loaded once; Helix is
   asked only for nearest chunks) and early-acknowledged writes with one durable barrier at the end.
 - Helix limits: ≤512 text-indexed node mutations per write; index DDL cannot share a batch with data; one writer;
@@ -146,7 +152,8 @@ Experiments are kept in `backup/experiment-*.ts`; eval runs in `eval.history.jso
 
 ```bash
 kb backup                      # ~3 min: entities, links with endpoints, judged chunk props → backup/<stamp>/*.jsonl
-kb check                       # invariants; exit 1 if one is broken
+kb check                       # invariants; article bookmarks judged, index-only posts exempt; EntityName parity
+kb entities --index-names      # dry run: EntityName backfill (Helix Entity.name build bug); --yes inserts missing names
 kb audit --sample 200          # random links + passages → file, for an independent reviewer (Claude / sol — not GLM)
 kb prune --yes                 # links under the floor, stale, duplicate pairs; orphan entities        no model calls
 kb vet --yes                   # Jev: unchecked LLM links; node-worthiness of every topic + thinly-held entity
@@ -156,78 +163,7 @@ kb dedupe --yes                # documents that are 100% identical-passage copie
 kb relate --yes                # passage↔passage RELATES_TO: graph proposes, Jev decides
 kb model --yes                 # owner + profile (1 LLM call), category parents (1 LLM call), EXTENDS/UPDATES (Jev), entity associations
 kb entities --resolve --yes    # co-occurrence / same slug proposes duplicates, Jev decides (≥0.9), merge; aliases kept
-bun eval.ts "<note>"           # 20 queries → eval.history.jsonl
+bun eval.ts "<note>"           # queries → eval.history.jsonl
 ```
 
 After any `--yes` run the backup it used is out of date: take a new one before the next hygiene command.
-Full restore: `backup/helix-volume-2026-09-20-preprune.tgz` is the whole Helix volume before any of this.
-
-## History
-
-| When | What | Links | Entities |
-|---|---|---|---|
-| 2026-09-19 | v2 full run (names in state, pack 13): Jev $2.59, GLM $0.91 | 462,799 | 28,338 |
-| 2026-09-20 | prune <0.8, stale, duplicates | 240,013 | 28,338 |
-| 2026-09-20 | vet GLM links + thin entities ($0.32) | 219,918 | 21,412 |
-| 2026-09-20 | **v4 re-link** (names only in questions, pack 6; Jev $3.3 incl. trials, GLM $0.75) at floor 0.85 | 185,954 | ~24k |
-| 2026-09-20 | floor 0.9 | 163,668 | ~24k |
-| 2026-09-20 | topics must be node-worthy ≥0.8 ($0.39): −9,750 topics | 90,771 | 15,095 |
-| 2026-09-20 | consolidate: 2,770 document-wide pairs, −16,277 passage copies | 74,494 | 15,095 |
-| 2026-09-20 | confirm: every link judged twice, mean ≥0.9 ($0.88): −22,888 | 51,605 | 15,095 |
-| 2026-09-20 | resolve: same name = one node (1,380 pairs) + 101 Jev-confirmed aliases → 1,216 merges | 46,857 | 13,622 |
-| 2026-09-20 | **dedupe: 1,270 documents were 100% passage-for-passage copies** (old "recovered" store) → 2,659 docs · 17,028 passages | 30,772 | 13,622 |
-| 2026-09-20 | **about-test** on every link ($0.58): −9,780 (7,704 only mentioned in passing, 3,539 failing the mean) → 20,992 | 20,992 | ~10,400 |
-| 2026-09-20 | dedupe, second pass: headers excluded from the copy test → 65 more documents were copies, −638 passages, −366 links, −28 orphan entities | 20,509 | 8,564 |
-| 2026-09-20 | resolve, second pass: spelling variants proposed and merged at 0.8 (example/VC OS, Workstream/Work Stream, example/Sand Water, …) → 44 merges, 45 entities folded, 122 links collapsed | 20,875 | 8,592 |
-| 2026-09-20 | (before that) prune 3,221 orphan entities; relate: 4,613 pairs judged ($0.42) → 332 RELATES_TO, 290 EXTENDS, 4 UPDATES; 2,634 entity associations; owner + profile + 10 category parents | 30,772 | ~10,400 |
-
-Search eval (graph-reached passages; grading method changed on 09-20 to one passage per request, so compare each
-run's `graph` to its own `next`): 09-19 0.51 vs 0.67 · 09-20 (220k links) 0.63 vs 0.67, 61 fresh · 09-20 (74k links)
-0.60 vs 0.74, 54 fresh, +540 ms/query.
-Final, 09-20 (2,659 docs, 30,772 links): top 0.88 · next 0.77 · graph 0.60 (81/129 useful, 43 plain search missed).
-Latency of the graph step is inside Jev-rerank noise: timed idle, a search took 6.8 s with the graph and 9-12 s
-without it on the same queries; the eval's per-query "added latency" column is not reliable while anything else runs.
-`kb check` passes: 0 unjudged, 0 under the floor, 0 unchecked LLM links, 0 orphans; 1.8 links per passage.
-
-## Audit (Claude, 2026-09-20, 40 random links of the 30,772-link graph, read by hand)
-
-30 hold · 6 are passing mentions (Harvard, Slack, Prague, Robert Goulet, Truett Cathy, the generic phrase "money
-models") · 4 could not be judged because the sample file truncated passages (fixed: `kb audit` now writes whole
-passages with edge and chunk ids). Those 6 all scored 0.92-0.97 on "discusses" — the reason the `about` test exists.
-`backup/experiment-passing-mentions.ts`: with `about ≥ 0.4`, 27/30 good links kept, 20/20 tracklist links kept, 2/6
-passing kept.
-
-**Re-audit after the about-test (Claude, 40 random links of the 20,997-link graph, whole passages):** 34 hold (85%) ·
-4 weak (two "Org: Example Research" meeting headers, COVID-19 as the backdrop of a story, MTN as one of three names in a
-partner list) · 2 wrong (5%: acquisition.com and value-based pricing, neither named nor discussed in the passage).
-Before the about-test: 75% held, 15% wrong. Sample: `backup/audit-sample-2026-09-20-18-03.jsonl`.
-
-**Targeted audit of the absent-name links (Claude, 40 draws / 37 distinct links, whole passages):** 33 hold · 4 weak
-(three of them the name of a recurring meeting series attached to a passage of that meeting; one an unnamed Ramp ad) ·
-**0 wrong**. This is the audit that killed the "the name must appear in the passage" rule and turned up the alias gap
-above. Sample: `backup/absent-sample-2026-09-20-20-21.jsonl`.
-
-## Open
-
-1. (closed) Absent-name links were measured and audited: 3.2% of links, 0 of 37 wrong. No rule added; the alias gap it
-   exposed was fixed instead. See "A name missing from its passage is not a wrong link" above.
-2. (closed) Ranking boost from the graph was tested and removed: top-8 0.845 plain vs 0.842 boosted over 20 queries, 16 of 160 slots changed (`eval-rank.ts`, 2026-09-20). Ranking stays vector + BM25 + Jev rerank; the graph filters and cross-references.
-3. 2,624 entities are held by a single passage — is one mention enough to earn a node? Needs a sample, not a rule.
-4. (closed) The 53 documents at 80-99% were the same videos ingested twice, differing only in their header passage;
-   65 documents went once the header stopped counting as content. See "The header passage is not content" above.
-5. (closed) The in-memory pool was timed: it halves Helix's read cost on a corpus pass and returns the identical
-   candidates. Early-acknowledged writes (`drainFast`) are still untimed — they are a write-path change and would
-   need a real pass to measure.
-8. **2,650 entities (53% of them, 13% of links) are held by exactly one passage.** They are mostly real and specific
-   ("How to Win Friends and Influence People", "Linux kernel", "Independent Petroleum Marketers Association of
-   Nigeria"), with a junk tail ("ridge point", "Pastry", "Lib_sheet.gs"). A single-passage entity can never be walked,
-   never joins two passages and never proposes a crosslink, so it adds nothing the eval can see; its only job is to be
-   a label you can search or filter by. Cutting them is cutting true information, so it is a policy call, not a quality
-   one — **example's to make.** Sample: `backup/single-sample-2026-09-20-20-53.jsonl`.
-6. Move the pipeline (model calls + orchestration) to a Railway service or Cloudflare Worker.
-7. (closed) The remaining Python is **acquisition, not pipeline**, and stays: `fetch_videos.py`, `fetch_jxnl.py`,
-   `fetch_dj.py`, `fetch_inference_mohit.py` download and write markdown into a directory, which `kb ingest <dir>`
-   then owns. Nothing is gained by rewriting a working downloader in TypeScript. What did need porting was
-   `audit_v4.py`'s three structural checks — a document with no passages, two documents under one documentId, a
-   passage whose document is gone — and those are now in `kb check`. `audit_v4.py` and `cleanup_v4.py` (which drives
-   the deleted `migrate_v2.py`) are dead; they are not deleted here because deleting is example's call.

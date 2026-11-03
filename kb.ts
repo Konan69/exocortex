@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// kb — example's HelixDB knowledgebase, one tool. Run `kb` for usage.
+// kb — HelixDB knowledgebase, one tool. Run `kb` for usage.
 //
 //   SourceDocument -HAS_CHUNK-> Chunk -MENTIONS{confidence >= 0.8, by: "jev" | "llm+jev"}-> Entity
 //                               Chunk -IN_CATEGORY{confidence}-> Category
@@ -8,7 +8,7 @@
 //   - an LLM (GLM) does the only jobs that need WRITING, in bulk and rarely: naming the entities in a stretch of
 //     text, and drafting the category taxonomy once
 //   - Jev (TypeSafe's System One model, via Cloudflare AI Gateway) does every DECISION: is this chunk really about
-//     entity X, which category, how much it matters, is it about example, is it boilerplate, does this passage answer
+//     entity X, which category, how much it matters, is it about the owner, is it boilerplate, does this passage answer
 //     the query. One parallel pass per chunk, typed answers with calibrated probabilities, ~$0.04 per million tokens.
 // Helix stores, indexes, searches and walks the graph. Nothing here is decided by string rules.
 import {
@@ -19,15 +19,17 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { generateObject } from "ai";
 import { z } from "zod";
 import { createHash } from "node:crypto";
+import { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const TENANT = "example", USER = "example";
+const TENANT = process.env.KB_TENANT ?? "demo", USER = process.env.KB_USER ?? "owner";
+const OWNER_NAME = process.env.KB_OWNER_NAME ?? USER;
 const HELIX = process.env.HELIX_URL ?? "http://localhost:6972";
 const EMBED_MODEL = "text-embedding-3-small", DIMS = 1536;
 const LLM = process.env.KB_MODEL ?? "z-ai/glm-5.3-flash";
-const GATEWAY = process.env.KB_AI_GATEWAY ?? "example-dev";
+const GATEWAY = process.env.KB_AI_GATEWAY ?? "kb";
 const CHUNK_CHARS = 4000, CHUNKS_PER_WRITE = 150;
 // A Jev request is filled to a token budget (its context is 32k): shared definitions once, then as many passages as fit.
 // (the estimate runs ~20% under Jev's own count, and its context is 32k)
@@ -39,14 +41,13 @@ const LINK_VERSION = 4;   // 4 = candidate names only in questions, 6 passages a
 // Below the floor a mention is "named in passing" and is not written. Measured: links kept from 0.5 made graph-reached
 // passages worse and up to 40x slower (eval.ts); and with one passage per request an independent LLM agrees with 54% of
 // Jev's links at 0.80-0.85, 80% at 0.85-0.90, 84% at 0.90-0.95, 96% at 0.95+ (kb audit, 2026-09-20) → 0.85.
+const RECUT_SHARE = 0.8;   // running-text copy test: headers and caption noise differ between pipelines, so not 1
 const DEDUPE_SHARE = Number(process.env.KB_DEDUPE_SHARE ?? 1);   // 1 = every passage of the copy exists in the kept document: nothing unique is lost
 const MENTION_FLOOR = 0.9, WORTHY_FLOOR = 0.4, TOPIC_FLOOR = 0.8, ABOUT_FLOOR = 0.4;
 // A pair whose two names are the same string once spacing and punctuation go ("Work Stream" / "Workstream") arrives
 // already carrying its evidence — Jev is only asked to veto it, and it reads two passages that never use the same
 // spelling, so it hedges: of 33 such pairs only 9 reached 0.9, while every one from 0.82 up was right by hand
-// (example/VC OS 0.88, Workstream/Work Stream 0.88, example/Sand Water 0.85). Below 0.8 it starts refusing for a
-// reason (Flow Node/FlowNode 0.53, Optic O/Optico 0.22). Measured 2026-09-20.
-const ALIAS_FLOOR = 0.8;   // 0.5 also dropped real definitions ("Mamba is a selective state-space model…" 0.47); passing mentions sit at 0.06-0.40   // example set 0.9 on 2026-09-20
+const ALIAS_FLOOR = 0.8;   // 0.5 also dropped real definitions ("Mamba is a selective state-space model…" 0.47); passing mentions sit at 0.06-0.40
 
 const client = Client.server(HELIX);
 const tenantScope = Predicate.eq("tenant_id", TENANT);
@@ -54,25 +55,19 @@ const tenantScope = Predicate.eq("tenant_id", TENANT);
 // ---------------------------------------------------------------- keys
 
 function openaiKey(): string {
-  const env = readFileSync(join(homedir(), "work/example/apps/web/.env"), "utf8");
-  const match = env.match(/^\s*(?:export\s+)?OPENAI_API_KEY\s*=\s*["']?([^"'\n]+)/m);
-  if (!match) throw new Error("no OPENAI_API_KEY in ~/work/example/apps/web/.env");
-  return match[1].trim();
+  if (!process.env.OPENAI_API_KEY) throw new Error("set OPENAI_API_KEY");
+  return process.env.OPENAI_API_KEY;
 }
 
 function openrouterKey(): string {
-  if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
-  const auth = JSON.parse(readFileSync(join(homedir(), ".pi/agent/auth.json"), "utf8"));
-  if (!auth.openrouter?.key) throw new Error("no OpenRouter key in ~/.pi/agent/auth.json");
-  return auth.openrouter.key;
+  if (!process.env.OPENROUTER_API_KEY) throw new Error("set OPENROUTER_API_KEY");
+  return process.env.OPENROUTER_API_KEY;
 }
 
 function cloudflare(): { token: string; account: string; gatewayToken: string } {
-  const env = readFileSync(join(homedir(), "work/example/apps/web/.env"), "utf8");
-  const get = (key: string) => process.env[key] ?? env.match(new RegExp(`^\\s*${key}\\s*=\\s*["']?([^"'\\n]+)`, "m"))?.[1]?.trim() ?? "";
-  const token = get("CLOUDFLARE_API_TOKEN"), account = get("CLOUDFLARE_ACCOUNT_ID");
-  if (!token || !account) throw new Error("no CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID");
-  return { token, account, gatewayToken: get("CF_AIG_TOKEN") };
+  const token = process.env.CLOUDFLARE_API_TOKEN, account = process.env.CLOUDFLARE_ACCOUNT_ID;
+  if (!token || !account) throw new Error("set CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID");
+  return { token, account, gatewayToken: process.env.CF_AIG_TOKEN ?? "" };
 }
 
 // ---------------------------------------------------------------- model calls
@@ -110,7 +105,7 @@ async function embed(texts: string[]): Promise<number[][]> {
   for (let start = 0; start < texts.length; start += 64) {
     const batch = texts.slice(start, start + 64);
     const data = await retrying("embed", async () => {
-      const response = await fetch("https://api.openai.com/v1/embeddings", {
+      const response = await fetch(process.env.KB_EMBED_URL ?? "https://api.openai.com/v1/embeddings", {
         method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiKey()}` },
         body: JSON.stringify({ model: EMBED_MODEL, input: batch }),
       });
@@ -126,7 +121,7 @@ async function embed(texts: string[]): Promise<number[][]> {
 // LLM: one schema-constrained completion through the AI SDK. Used only where text has to be written.
 let openrouter: ReturnType<typeof createOpenRouter> | undefined;
 async function llm<T>(system: string, prompt: string, schema: z.ZodType<T>): Promise<T> {
-  openrouter ??= createOpenRouter({ apiKey: openrouterKey() });
+  openrouter ??= createOpenRouter({ apiKey: openrouterKey(), baseURL: process.env.KB_OPENROUTER_URL ?? "https://openrouter.ai/api/v1" });
   return llmSlot(async () => {
     // (the generic schema defeats generateObject's overload inference; the result is still validated against it)
     const result = await generateObject<any>({
@@ -170,18 +165,18 @@ async function jev(state: string | object, questions: Record<string, Question>):
     await paced();
     let response: Response;
     if (JEV_ROUTE === "openrouter") {
-      response = await fetch("https://openrouter.ai/api/alpha/decisions", {
+      response = await fetch(process.env.KB_JEV_URL ?? "https://openrouter.ai/api/alpha/decisions", {
         method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${openrouterKey()}` },
         body: JSON.stringify({ model: "typesafe/jev-1.13", state, questions }), signal: AbortSignal.timeout(120_000),
       });
     } else {
       const { token, account, gatewayToken } = cloudflare();
-      response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/ai/run`, {
+      response = await fetch(`${process.env.KB_CLOUDFLARE_URL ?? "https://api.cloudflare.com/client/v4"}/accounts/${account}/ai/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json", Authorization: `Bearer ${token}`,
           "cf-aig-gateway-id": GATEWAY, ...(gatewayToken ? { "cf-aig-authorization": `Bearer ${gatewayToken}` } : {}),
-          "cf-aig-metadata": JSON.stringify({ workload: "example-kb" }),
+          "cf-aig-metadata": JSON.stringify({ workload: "kb" }),
         },
         body: JSON.stringify({ model: "typesafe/jev", input: { state, questions } }), signal: AbortSignal.timeout(120_000),
       });
@@ -229,6 +224,8 @@ function normalise(name: string): string {
 }
 const entityKeyOf = (kind: string, name: string) => `${TENANT}:${kind}:${normalise(name)}`;
 const categoryKeyOf = (name: string) => `${TENANT}:${normalise(name)}`;
+const entityNameProps = (entity: { name: string; entityKey: string; kind: string }) =>
+  ({ tenant_id: TENANT, userId: USER, name: entity.name.trim(), entityKey: entity.entityKey, kind: entity.kind });
 
 async function bootstrap() {
   const specs: [string, IndexSpec][] = [
@@ -243,6 +240,10 @@ async function bootstrap() {
     ["chunk_txt", IndexSpec.nodeText("Chunk", "content", "tenant_id")],
     ["chunk_naming", IndexSpec.nodeEquality("Chunk", "needsNaming")], ["chunk_hash", IndexSpec.nodeEquality("Chunk", "contentHash")],
     ["cat_key", IndexSpec.nodeUniqueEquality("Category", "categoryKey")], ["ent_key", IndexSpec.nodeEquality("Entity", "entityKey")],
+    // Helix v0.0.5 loops at validate_manifests when backfilling text over existing Entity nodes.
+    // Index this empty shadow label first; subsequent EntityName writes are maintained incrementally.
+    ["entity_name_key", IndexSpec.nodeUniqueEquality("EntityName", "entityKey")],
+    ["entity_name_txt", IndexSpec.nodeText("EntityName", "name", "tenant_id")],
   ];
   let batch: any = writeBatch();
   for (const [name, spec] of specs) batch = batch.varAs(name, g().createIndexIfNotExists(spec));
@@ -251,6 +252,8 @@ async function bootstrap() {
     const receipts = await write<Record<string, any>>(batch.returning(specs.map(([name]) => name)), "bootstrap");
     const building = Object.entries(receipts).filter(([, receipt]) => receipt?.kind !== "already_active").map(([name]) => name);
     if (!building.length) return;
+    if (building.some((name) => name.startsWith("entity_name_")) && attempt >= 40)
+      throw new Error(`EntityName indexes did not activate within two minutes (${building.join(", ")}); Helix v0.0.5 index-build bug — do not index Entity.name directly`);
     if (attempt > 200) throw new Error(`indexes never became active: ${building.join(", ")}`);
     if (attempt % 5 === 0) console.log(`waiting for indexes: ${building.join(", ")}`);
     await Bun.sleep(3000);
@@ -427,7 +430,7 @@ async function loadPool(): Promise<Pool> {
   return { linksOf, rosterOf };
 }
 
-type LinkStats = { chunks: number; mentions: number; flagged: number; named: number; rejected?: number; notDiscussed?: number; notWorthy?: number };
+type LinkStats = { chunks: number; mentions: number; flagged: number; named: number; namedChunks?: number; rejected?: number; notDiscussed?: number; notWorthy?: number; namingFailures?: number };
 
 // chunk ids -> judged and written. Pages keep memory flat; packs fill Jev's context.
 async function linkChunks(chunkIds: string[], docOf: Map<string, Doc>, categories: Category[], stats: LinkStats, onProgress?: () => void, memory?: Pool) {
@@ -584,7 +587,7 @@ async function nameChunks(chunkIds: string[], docOf: Map<string, Doc>, stats: Li
   // A page the model cannot answer (it returns nothing on very long inputs) is halved and retried, down to one passage.
   const namePage = async (page: string[]): Promise<void> => {
     try { await nameOnePage(page); } catch (error) {
-      if (page.length === 1) { console.error(`FAILED naming ${page[0]}: ${String(error).slice(0, 120)}`); return; }
+      if (page.length === 1) { stats.namingFailures = (stats.namingFailures ?? 0) + 1; console.error(`FAILED naming ${page[0]}: ${String(error).slice(0, 200)}`); return; }
       const half = Math.ceil(page.length / 2);
       await namePage(page.slice(0, half)); await namePage(page.slice(half));
     }
@@ -657,7 +660,8 @@ Most passages add zero to three names; when in doubt leave it out — a rejected
       out = out
         .varAs(`n${index}x`, g().nWithLabelWhere("Entity", SourcePredicate.eq("entityKey", key)).where(tenantScope).limit(1))
         .varAsIf(`n${index}n`, BatchCondition.varEmpty(`n${index}x`), g().addN("Entity", { tenant_id: TENANT, entityKey: key, name: entity.name.trim(), kind: entity.kind, entityType: entity.kind,
-        }));
+        }))
+        .varAsIf(`s${index}`, BatchCondition.varEmpty(`n${index}x`), g().addN("EntityName", entityNameProps({ ...entity, entityKey: key })));
     });
     let edge = 0;
     page.forEach((chunkId, index) => {
@@ -668,9 +672,9 @@ Most passages add zero to three names; when in doubt leave it out — a rejected
         out = out.varAsIf(`l${edge++}`, BatchCondition.varNotEmpty(`${varOf.get(key)}${suffix}`), g().n(NodeRef.var(me)).addE("MENTIONS", NodeRef.var(`${varOf.get(key)}${suffix}`), { tenant_id: TENANT, confidence: confidenceOf.get(`${chunkId}\u0000${key}`)!, entityKey: key, by: "llm+jev" }));
     });
     await write(out.returning([]), "name_chunks");
-    stats.named += entries.length; stats.chunks += page.length; stats.mentions += [...perChunk.values()].reduce((sum, keys) => sum + keys.length, 0);
+    stats.named += entries.length; stats.namedChunks = (stats.namedChunks ?? 0) + page.length; stats.mentions += [...perChunk.values()].reduce((sum, keys) => sum + keys.length, 0);
     stats.rejected = (stats.rejected ?? 0) + proposed - kept.size;
-    console.log(`[${new Date().toTimeString().slice(0, 8)}] named ${stats.chunks}/${chunkIds.length} passages · ${stats.named} names kept, ${stats.rejected} rejected by Jev (${stats.notDiscussed ?? 0} not discussed, ${stats.notWorthy ?? 0} not node-worthy) · ${usage.llmCalls} llm calls`);
+    console.log(`[${new Date().toTimeString().slice(0, 8)}] named ${stats.namedChunks}/${chunkIds.length} passages · ${stats.named} names kept, ${stats.rejected} rejected by Jev (${stats.notDiscussed ?? 0} not discussed, ${stats.notWorthy ?? 0} not node-worthy) · ${usage.llmCalls} llm calls`);
   }
 }
 
@@ -837,11 +841,182 @@ async function ingest(args: Args) {
   if (counts.failed) process.exit(1);
 }
 
+// ---------------------------------------------------------------- fast bookmark ingest
+
+type Bookmark = {
+  id?: string; tweetId?: string; url?: string; text?: string; authorHandle?: string; authorName?: string; postedAt?: string;
+  links?: unknown; quotedTweet?: { text?: string; authorHandle?: string; authorName?: string; links?: unknown; url?: string };
+};
+type BookmarkLabel = { id: string; category: string; confidence?: number; signal?: number };
+type BookmarkDbRow = { id: string; links_json?: string | null; quoted_tweet_json?: string | null; article_title?: string | null; article_text?: string | null; folder_names?: string | null };
+type BookmarkIndexRow = { documentId: string; title: string; url: string; content: string; category: string; salience: number; folders: string; postedAt: string };
+
+const expandHome = (path: string) => path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+const jsonArray = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (typeof value !== "string" || !value.trim()) return [];
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []; }
+  catch { return []; }
+};
+const jsonLines = <T>(path: string): T[] => readFileSync(path, "utf8").split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line) as T);
+const wellFormed = (value: string) => {
+  let output = "";
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { output += value.charAt(index) + value.charAt(++index); continue; }
+      output += "�";
+    } else output += code >= 0xdc00 && code <= 0xdfff ? "�" : value.charAt(index);
+  }
+  return output;
+};
+const isTco = (url: string) => { try { return new URL(url).hostname.toLowerCase() === "t.co"; } catch { return /^https?:\/\/t\.co(?:\/|$)/i.test(url); } };
+
+function bookmarkDb(path: string): Map<string, BookmarkDbRow> {
+  if (!existsSync(path)) return new Map();
+  const db = new Database(path, { readonly: true });
+  try {
+    const rows = db.query("SELECT id, links_json, quoted_tweet_json, article_title, article_text, folder_names FROM bookmarks").all() as BookmarkDbRow[];
+    return new Map(rows.map((row) => [String(row.id), row]));
+  } finally { db.close(); }
+}
+
+function bookmarkContent(bookmark: Bookmark, extra?: BookmarkDbRow): string {
+  let quoted = bookmark.quotedTweet;
+  if (!quoted && extra?.quoted_tweet_json) { try { quoted = JSON.parse(extra.quoted_tweet_json); } catch {} }
+  const author = bookmark.authorHandle ? `${bookmark.authorName || bookmark.authorHandle} (@${bookmark.authorHandle})` : bookmark.authorName || "unknown";
+  const quoteAuthor = quoted?.authorHandle ? `${quoted.authorName || quoted.authorHandle} (@${quoted.authorHandle})` : quoted?.authorName;
+  const links = [...new Set([...jsonArray(bookmark.links), ...jsonArray(quoted?.links), ...jsonArray(extra?.links_json), ...(quoted?.url ? [quoted.url] : [])])].filter((url) => !isTco(url));
+  return [
+    `Author: ${author}`,
+    bookmark.text?.trim() ?? "",
+    quoted?.text?.trim() ? `Quoted post${quoteAuthor ? ` by ${quoteAuthor}` : ""}:\n${quoted.text.trim()}` : "",
+    links.length ? `Links:\n${links.join("\n")}` : "",
+    extra?.article_title?.trim() ? `Article: ${extra.article_title.trim()}` : "",
+    extra?.article_text?.trim() ? `Article text:\n${extra.article_text.trim().slice(0, 3000)}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+// kb bookmarks [jsonl] [...] — intentionally skips Jev linking, LLM naming, and settling: bookmarks need a cheap searchable path.
+async function bookmarks(args: Args) {
+  const started = Date.now();
+  const sourcePath = expandHome(args.positional[0] ?? process.env.KB_BOOKMARKS ?? "./data/bookmarks.jsonl");
+  const labelsPath = expandHome(args.values("--labels")[0] ?? process.env.KB_LABELS ?? "./data/labels.jsonl");
+  const skipPath = expandHome(args.values("--skip")[0] ?? process.env.KB_SKIP ?? "./data/tombstoned.json");
+  const dbPath = expandHome(args.values("--ftdb")[0] ?? process.env.KB_BOOKMARK_DB ?? "./data/bookmarks.db");
+  const labels = new Map((existsSync(labelsPath) ? jsonLines<BookmarkLabel>(labelsPath) : []).map((row) => [String(row.id), row]));
+  const skipValue = existsSync(skipPath) ? JSON.parse(readFileSync(skipPath, "utf8")) : [];
+  const skippedIds = new Set<string>((Array.isArray(skipValue) ? skipValue : Object.keys(skipValue ?? {})).map(String));
+  const extras = bookmarkDb(dbPath), rows: BookmarkIndexRow[] = [], articles = new Set<string>();
+  let skipped = 0;
+  for (const bookmark of jsonLines<Bookmark>(sourcePath)) {
+    const id = String(bookmark.id ?? bookmark.tweetId ?? "");
+    if (!id || skippedIds.has(id)) { skipped++; continue; }
+    const label = labels.get(id), extra = extras.get(id), text = bookmark.text?.trim() ?? "";
+    if ((extra?.article_text?.trim().length ?? 0) > 200) articles.add(`x:${id}`);
+    const folders = jsonArray(extra?.folder_names).join(", ");
+    rows.push({
+      documentId: `x:${id}`, url: wellFormed(bookmark.url ?? `https://x.com/i/status/${id}`),
+      title: wellFormed(`@${bookmark.authorHandle || "unknown"}: ${text.replace(/\s+/g, " ").slice(0, 80)}`),
+      content: wellFormed(bookmarkContent(bookmark, extra)), category: wellFormed(label?.category ?? "unclassified"),
+      salience: Math.min(1, Math.max(0, Number(label?.signal ?? 0) / 3)), folders: wellFormed(folders), postedAt: wellFormed(bookmark.postedAt ?? ""),
+    });
+  }
+  if (args.has("--graph")) return bookmarkGraph(args, rows.filter((row) => articles.has(row.documentId)));
+  const existingIds = new Set<string>();
+  const unchanged = new Set<string>();
+  const regraph = new Set<string>();
+  for (let start = 0; start < rows.length; start += 400) {
+    const page = rows.slice(start, start + 400), ids = page.map((row) => row.documentId);
+    const found = await read<{ found: { documentId: string }[] | null; chunks: (BookmarkIndexRow & { contentHash: string; linkVersion?: number })[] | null }>(readBatch()
+      .varAs("found", g().nWithLabelWhere("SourceDocument", Predicate.isIn("documentId", ids)).where(tenantScope).project(fields("documentId")))
+      .varAs("chunks", g().nWithLabelWhere("Chunk", Predicate.isIn("documentId", ids)).where(tenantScope).project(fields("documentId", "contentHash", "category", "salience", "folders", "postedAt", "title", "linkVersion")))
+      .returning(["found", "chunks"]), "bookmark_exists");
+    for (const row of found.found ?? []) existingIds.add(row.documentId);
+    const current = new Map((found.chunks ?? []).map((chunk) => [chunk.documentId, chunk]));
+    for (const row of page) {
+      const old = current.get(row.documentId);
+      if (!old) continue;
+      const sameContent = old.contentHash === passageHash(row.content), linked = Number(old.linkVersion ?? 0) === LINK_VERSION;
+      // A graph-linked article's Jev category/salience replace the import labels; preserving its node keeps its edges.
+      if (sameContent && (linked || (old.category === row.category && Number(old.salience) === row.salience && old.folders === row.folders && old.postedAt === row.postedAt && old.title === row.title))) unchanged.add(row.documentId);
+      if (linked && !sameContent) regraph.add(row.documentId);
+    }
+  }
+  const replace = args.has("--replace"), pending = rows.filter((row) => replace ? !unchanged.has(row.documentId) : !existingIds.has(row.documentId));
+  const summary = () => ({ indexed: pending.length, skipped, existing: existingIds.size, unchanged: replace ? unchanged.size : undefined, regraph: replace ? regraph.size : undefined, ms: Date.now() - started });
+  if (replace && regraph.size) console.error(`${regraph.size} changed graph-linked articles will be rewritten; run kb bookmarks --graph --redo afterward`);
+  if (args.has("--dry-run")) {
+    console.log(JSON.stringify(summary()));
+    (pending.length ? pending : rows).slice(0, 2).forEach((row, index) => console.log(`\n--- sample ${index + 1}: ${row.documentId} ---\n${row.content}`));
+    return;
+  }
+  if (pending.length) {
+    await bootstrap();
+    const vectors = await embed(pending.map((row) => row.content));
+    for (let start = 0; start < pending.length; start += 50) {
+      let batch: any = writeBatch();
+      pending.slice(start, start + 50).forEach((row, offset) => {
+        const index = start + offset, document = `d${offset}`, chunk = `c${offset}`;
+        if (replace) batch = batch.varAs(`oc${offset}`, chunksOfDocument(row.documentId).drop()).varAs(`od${offset}`, documentById(row.documentId).drop());
+        const metadata = { category: row.category, salience: row.salience, folders: row.folders, postedAt: row.postedAt };
+        batch = batch
+          .varAs(document, g().addN("SourceDocument", {
+            tenant_id: TENANT, userId: USER, documentId: row.documentId, customId: row.documentId.slice(2), title: row.title,
+            source: "x", sourceType: "x", kind: "x_bookmark", url: row.url, uri: row.url, chunkCount: 1,
+            checksum: createHash("sha256").update(row.content).digest("hex").slice(0, 24), status: "indexed", createdAt: Expr.datetime(),
+            category: row.category, salience: row.salience, folders: row.folders, postedAt: row.postedAt, metadata,
+          }))
+          .varAs(chunk, g().addN("Chunk", {
+            tenant_id: TENANT, userId: USER, chunkId: `${row.documentId}:0`, documentId: row.documentId, title: row.title,
+            chunkIndex: 0, ordinal: 0, documentKind: "x_bookmark", source: "x", content: row.content, contentHash: passageHash(row.content),
+            embedding: PropertyValue.f32Array(vectors[index]!), embeddingModel: `openai:${EMBED_MODEL}`, createdAt: Expr.datetime(),
+            category: row.category, salience: row.salience, folders: row.folders, postedAt: row.postedAt,
+          }))
+          .varAs(`h${offset}`, g().n(NodeRef.var(document)).addE("HAS_CHUNK", NodeRef.var(chunk), { tenant_id: TENANT, ordinal: 0 }));
+      });
+      await write(batch.returning([]), "bookmarks_ingest");
+    }
+  }
+  console.log(JSON.stringify(summary()));
+}
+
+// WHY: one-line posts stay out of the graph: linking them mints entities from banter; articles carry reusable subjects.
+async function bookmarkGraph(args: Args, articles: BookmarkIndexRow[]) {
+  const docOf = new Map(articles.map((row) => [row.documentId, { documentId: row.documentId, title: row.title, kind: "x_bookmark", source: "x", url: row.url }]));
+  const states: { chunkId: string; documentId: string; linkVersion?: number }[] = [];
+  for (let start = 0; start < articles.length; start += 400) {
+    const ids = articles.slice(start, start + 400).map((row) => `${row.documentId}:0`);
+    const data = await read<{ chunks: typeof states | null }>(readBatch().varAs("chunks", g().nWithLabelWhere("Chunk", Predicate.isIn("chunkId", ids)).where(tenantScope)
+      .project(fields("chunkId", "documentId", "linkVersion"))).returning(["chunks"]), "bookmark_graph_states");
+    states.push(...data.chunks ?? []);
+  }
+  let pending = states.filter((row) => docOf.has(row.documentId) && (args.has("--redo") || Number(row.linkVersion ?? 0) !== LINK_VERSION)).map((row) => row.chunkId);
+  if (args.values("--limit").length) pending = pending.slice(0, args.number("--limit", pending.length));
+  console.log(`${articles.length} article bookmarks, ${states.length} indexed chunks, ${pending.length} to judge → ~${Math.ceil(pending.length / PACK)} Jev requests (${PACK} passages each, ≈ $${(pending.length * 2300 * 0.042 / 1e6).toFixed(2)}), naming + settling extra`);
+  if (args.has("--dry-run") || !pending.length) return;
+  await bootstrap();
+  const categories = await taxonomy(), stats: LinkStats = { chunks: 0, mentions: 0, flagged: 0, named: 0 }, started = Date.now();
+  const memory = await loadPool();
+  try {
+    drainFast = true;
+    await linkChunks(pending, docOf, categories, stats, undefined, memory);
+  } finally { drainFast = false; }
+  const flagged = await read<{ chunks: { chunkId: string }[] | null }>(readBatch().varAs("chunks", g().nWithLabelWhere("Chunk", Predicate.isIn("chunkId", pending)).where(tenantScope)
+    .where(Predicate.eq("needsNaming", true)).project(fields("chunkId"))).returning(["chunks"]), "bookmark_graph_flagged");
+  await nameChunks((flagged.chunks ?? []).map((row) => row.chunkId), docOf, stats);
+  if (stats.namingFailures) console.error(`${stats.namingFailures} passages failed naming; rerun --graph --redo after fixing the model route`);
+  for (const chunkId of pending) await settleDocument(chunkId.slice(0, -2), stats);
+  await write(writeBatch().varAs("settled", g().nWithLabel("Category").where(tenantScope).limit(1).setProperty("settledAt", Expr.datetime())).returning([]), "settle");
+  report(stats, started);
+}
+
 // ---------------------------------------------------------------- filters
 
 type Args = { positional: string[]; values: (name: string) => string[]; has: (name: string) => boolean; number: (name: string, fallback: number) => number };
 
-const BOOLEAN_FLAGS = new Set(["--replace", "--all-entities", "--chunks", "--full", "--no-graph", "--no-rerank", "--json", "--dry-run", "--redo", "--seed", "--resolve", "--mine", "--with-boilerplate", "--yes"]);
+const BOOLEAN_FLAGS = new Set(["--replace", "--all-entities", "--chunks", "--full", "--no-graph", "--no-rerank", "--rerank", "--json", "--dry-run", "--redo", "--graph", "--index-names", "--seed", "--resolve", "--mine", "--with-boilerplate", "--yes"]);
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [], flags = new Map<string, string[]>();
   for (let index = 0; index < argv.length; index++) {
@@ -921,30 +1096,121 @@ async function chunkStream(args: Args): Promise<any | null> {
   return g().nWithLabelWhere("Chunk", Predicate.isIn("chunkId", shared)).where(narrowed);
 }
 
+// Helix v0.0.5 cannot backfill a text index on populated Entity; create EntityName indexes while empty, then
+// insert one shadow node per Entity. Incremental text-index maintenance works. Dry run leaves graph unchanged.
+async function indexEntityNames(args: Args) {
+  if (args.has("--yes")) await bootstrap();
+  const project = fields("entityKey", "name", "kind");
+  const data = await read<{ entities: { entityKey: string; name: string; kind: string }[] | null; shadows: { entityKey: string; name: string; kind: string }[] | null }>(readBatch()
+    .varAs("entities", g().nWithLabel("Entity").where(tenantScope).project(project))
+    .varAs("shadows", g().nWithLabel("EntityName").where(tenantScope).project(project))
+    .returning(["entities", "shadows"]), "entity_name_backfill_state");
+  const entities = data.entities ?? [], shadows = data.shadows ?? [];
+  const keys = new Set<string>();
+  for (const row of entities) { if (keys.has(row.entityKey)) throw new Error(`duplicate Entity key: ${row.entityKey}`); keys.add(row.entityKey); }
+  const existing = new Map<string, { entityKey: string; name: string; kind: string }>();
+  for (const row of shadows) { if (existing.has(row.entityKey)) throw new Error(`duplicate EntityName key: ${row.entityKey}`); existing.set(row.entityKey, row); }
+  const missing = entities.filter((row) => !existing.has(row.entityKey));
+  const changed = entities.filter((row) => { const old = existing.get(row.entityKey); return old && (old.name !== row.name || old.kind !== row.kind); });
+  const extra = shadows.filter((row) => !keys.has(row.entityKey));
+  console.log(`${entities.length} entities · ${shadows.length} EntityName nodes · ${missing.length} missing · ${changed.length} stale · ${extra.length} without Entity`);
+  if (!args.has("--yes")) return console.log("dry run — add --yes to index names");
+  for (let start = 0; start < missing.length; start += 60) {
+    let batch: any = writeBatch();
+    missing.slice(start, start + 60).forEach((row, index) => { batch = batch.varAs(`n${index}`, g().addN("EntityName", entityNameProps(row))); });
+    await write(batch.returning([]), "entity_name_backfill");
+    if ((start / 60) % 20 === 0 || start + 60 >= missing.length) console.log(`  indexed ${Math.min(start + 60, missing.length)}/${missing.length}`);
+  }
+  for (let start = 0; start < changed.length; start += 60) {
+    let batch: any = writeBatch();
+    changed.slice(start, start + 60).forEach((row, index) => { batch = batch.varAs(`n${index}`, g().nWithLabelWhere("EntityName", SourcePredicate.eq("entityKey", row.entityKey)).where(tenantScope)
+      .setProperty("name", row.name).setProperty("kind", row.kind)); });
+    await write(batch.returning([]), "entity_name_sync");
+  }
+  if (extra.length) console.error(`${extra.length} stale EntityName nodes remain; inspect before deleting`);
+  console.log(`DONE ${missing.length} indexed, ${changed.length} updated`);
+}
+
 // ---------------------------------------------------------------- search
 
-type Hit = { id: number; chunkId: string; documentId: string; title: string; chunkIndex: number; content: string; category?: string; salience?: number };
+type Hit = { id: number; chunkId: string; documentId: string; title: string; chunkIndex: number; content: string; category?: string; salience?: number; distance?: number };
 type Ranked = { hit: Hit; score: number; via: string[]; relevance?: number };
 
-//   kb search "<q>" [filters] [--mode hybrid|vector|text] [--k N] [--top N] [--chunks] [--expand N] [--full] [--no-rerank] [--no-graph] [--json]
+// WHY: the graph holds what saved things are about; BM25 catches wording with no entity. Query embeddings and
+// Jev reranking were cut from bookmark search for speed at the owner's request.
+async function graphSearch(query: string, args: Args, K: number, project: PropertyProjection[]): Promise<Hit[]> {
+  const keys = ENTITY_KINDS.map((kind) => entityKeyOf(kind, query));
+  const entityProject = [PropertyProjection.renamed("$id", "id"), ...fields("name", "kind", "entityKey")];
+  let names: { entityKey: string }[] = [], exact: { entityKey: string }[] = [];
+  try {
+    const found = await read<{ names: { entityKey: string }[] | null; exact: { entityKey: string }[] | null }>(readBatch()
+      .varAs("names", g().textSearchNodes("EntityName", "name", query.slice(0, 200), 16, TENANT).project(fields("entityKey")))
+      .varAs("exact", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", keys)).where(tenantScope).project(fields("entityKey")))
+      .returning(["names", "exact"]), "search_graph_names");
+    names = found.names ?? []; exact = found.exact ?? [];
+  } catch (error) {
+    if (String(error).includes("missing Node text index")) throw new Error("EntityName BM25 index missing — run `kb entities --index-names --yes` (Helix must build the empty-label index first)");
+    throw error;
+  }
+  const orderedKeys = [...new Set([...exact, ...names].map((row) => row.entityKey))].slice(0, 8);
+  if (!orderedKeys.length) return [];
+  const mapped = await read<{ entities: (Candidate & { id: number })[] | null }>(readBatch().varAs("entities",
+    g().nWithLabelWhere("Entity", Predicate.isIn("entityKey", orderedKeys)).where(tenantScope).project(entityProject)).returning(["entities"]), "search_graph_entity_keys");
+  const byKey = new Map((mapped.entities ?? []).map((row) => [row.entityKey, row]));
+  const entities = orderedKeys.map((key) => byKey.get(key)).filter((row): row is Candidate & { id: number } => !!row);
+  if (!entities.length) return [];
+  const { anchor } = chunkFilters(args), filter = Predicate.and([postFilter(args), ...anchor]);
+  let batch: any = readBatch();
+  entities.forEach((entity, index) => {
+    batch = batch.varAs(`p${index}`, g().n(Number(entity.id)).in("MENTIONS")
+      .union([sub().hasLabel("Chunk"), sub().hasLabel("SourceDocument").out("HAS_CHUNK")])
+      .where(filter).dedup().limit(Math.max(K * 8, 80)).project(project));
+  });
+  const reached = await read<Record<string, Hit[] | null>>(batch.returning(entities.map((_, index) => `p${index}`)), "search_graph_passages");
+
+  const tally = new Map<number, { hit: Hit; weight: number; matches: number }>();
+  entities.forEach((_, rank) => {
+    for (const hit of reached[`p${rank}`] ?? []) {
+      const entry = tally.get(Number(hit.id)) ?? { hit, weight: 0, matches: 0 };
+      entry.weight += 1 / (rank + 1); entry.matches++; tally.set(Number(hit.id), entry);
+    }
+  });
+  return [...tally.values()].sort((a, b) => b.weight - a.weight || b.matches - a.matches || Number(b.hit.salience ?? 0) - Number(a.hit.salience ?? 0)).slice(0, K).map((row) => row.hit);
+}
+
+//   kb search "<q>" [filters] [--mode graph|hybrid|vector|text] [--k N] [--top N] [--page N] [--chunks] [--expand N] [--full] [--rerank] [--no-graph] [--json]
 async function search(args: Args) {
   const query = args.positional.join(" ");
   if (!query) throw new Error(USAGE);
-  const mode = args.values("--mode")[0] ?? "hybrid", K = args.number("--k", 24), top = args.number("--top", 8), started = Date.now();
+  const kinds = args.values("--kind"), bookmarksOnly = kinds.length > 0 && kinds.every((kind) => kind === "x_bookmark");
+  // A bare name holds no context for an embedding: measured 2026-10-12, a nonsense query sat at cosine distance 0.30,
+  // real name passages at 0.30-0.33 and unrelated posts at 0.32, so no distance floor separates
+  // them. Lookups of up to three words therefore go by entity graph + BM25 only; the vector channel is for questions.
+  const lookup = query.trim().split(/\s+/).length <= 3, chosen = args.values("--mode")[0];
+  const mode = chosen ?? (bookmarksOnly || lookup ? "graph" : "hybrid"), top = args.number("--top", 8), page = Math.max(1, args.number("--page", 1)), started = Date.now();
+  const K = args.number("--k", Math.max(24, page * top * 3));   // deep enough that the asked-for page is ranked, not padded
+  if (!["graph", "hybrid", "vector", "text"].includes(mode)) throw new Error(`unknown search mode: ${mode}`);
   const project = [PropertyProjection.renamed("$id", "id"), ...fields("chunkId", "documentId", "title", "chunkIndex", "content", "category", "salience")];
   // Filters build the candidate stream first; vector/BM25 then rank only those candidates (Helix prefiltering).
   const channels: [string, any][] = [];
-  if (mode !== "text") {
+  if (mode === "vector" || mode === "hybrid") {
     const [vector] = await embed([query]);
-    channels.push(["~", ((await chunkStream(args))?.vectorSearch("Chunk", "embedding", vector, K, TENANT) ?? g().vectorSearchNodes("Chunk", "embedding", vector, K, TENANT).where(postFilter(args))).project(project)]);
+    channels.push(["~", ((await chunkStream(args))?.vectorSearch("Chunk", "embedding", vector, K, TENANT) ?? g().vectorSearchNodes("Chunk", "embedding", vector, K, TENANT).where(postFilter(args))).project([...project, PropertyProjection.renamed("$distance", "distance")])]);
   }
   if (mode !== "vector") channels.push(["=", ((await chunkStream(args))?.textSearch("Chunk", "content", query.slice(0, 200), K, TENANT) ?? g().textSearchNodes("Chunk", "content", query.slice(0, 200), K, TENANT).where(postFilter(args))).project(project)]);
   // Independent reads: a slow channel must not cost the other its results.
-  const lists = await Promise.all(channels.map(async ([name, traversal]) => {
+  const graphList = mode === "graph" || mode === "hybrid" ? graphSearch(query, args, K, project).then((hits) => ["G", hits] as [string, Hit[]]) : null;
+  const keywordLists = Promise.all(channels.map(async ([name, traversal]) => {
     const data = await read<{ hits: Hit[] | null }>(readBatch().varAs("hits", traversal).returning(["hits"]), `search_${name}`)
       .catch((error) => { console.error(`(${name} channel failed: ${String(error).slice(0, 80)})`); return { hits: [] as Hit[] }; });
     return [name, data.hits ?? []] as [string, Hit[]];
   }));
+  const lists = graphList ? [await graphList, ...await keywordLists] : await keywordLists;
+  if (!chosen && mode === "graph" && !bookmarksOnly && lists.every(([, list]) => !list.length)) {   // no name and no wording matched: meaning is all that is left
+    const [vector] = await embed([query]);
+    const data = await read<{ hits: Hit[] | null }>(readBatch().varAs("hits", ((await chunkStream(args))?.vectorSearch("Chunk", "embedding", vector, K, TENANT) ?? g().vectorSearchNodes("Chunk", "embedding", vector, K, TENANT).where(postFilter(args))).project([...project, PropertyProjection.renamed("$distance", "distance")])).returning(["hits"]), "search_~");
+    lists.push(["~", data.hits ?? []]);
+  }
   // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them.
   const fused = new Map<number, Ranked>();
   for (const [channel, list] of lists) list.forEach((hit, rank) => {
@@ -953,12 +1219,15 @@ async function search(args: Args) {
   });
   let ranked = [...fused.values()].sort((a, b) => b.score - a.score);
   const best = ranked[0]?.score ?? 1;
-  for (const entry of ranked) entry.score = entry.score / best + 0.3 * Number(entry.hit.salience ?? 0);   // Helix: w_rrf 1.0, w_sal 0.3
+  for (const entry of ranked) entry.score = entry.score / best;
 
-  // Jev as the cross-encoder in Helix's re-rank formula: reads each candidate against the query, in parallel.
-  if (!args.has("--no-rerank") && ranked.length) {
-    const pool = ranked.slice(0, Math.max(top * 2, 12));
+  // Jev re-ranking is opt-in to avoid a model
+  // call per candidate on every search. Read further down the list with --page instead.
+  const rerank = args.has("--rerank") && !args.has("--no-rerank");
+  if (rerank && ranked.length) {
+    const pool = ranked.slice(0, Math.max(page * top * 2, 12));
     await Promise.all(pool.map(async (entry) => {
+      entry.score += 0.3 * Number(entry.hit.salience ?? 0);   // Helix: w_rrf 1.0, w_sal 0.3
       const answers = await jev({ request: query, passage: entry.hit.content }, { useful: noul("The passage answers the request or contains information directly useful for it") }).catch(() => null);
       entry.relevance = answers?.useful?.noul;
       if (entry.relevance !== undefined) entry.score = entry.relevance + 0.2 * entry.score;
@@ -970,7 +1239,7 @@ async function search(args: Args) {
     for (const entry of ranked) if (!perDocument.has(entry.hit.documentId)) perDocument.set(entry.hit.documentId, entry);
     ranked = [...perDocument.values()];
   }
-  const hits = ranked.slice(0, top);
+  const hits = ranked.slice((page - 1) * top, page * top), more = ranked.length > page * top;
 
   const expand = args.number("--expand", 0);
   if (expand && hits.length) {
@@ -983,7 +1252,7 @@ async function search(args: Args) {
   }
   const graph = args.has("--no-graph") || !hits.length ? null : await expandChunks(hits.slice(0, 6).map((entry) => entry.hit.chunkId));   // chunk ids, so --chunks or not
 
-  if (args.has("--json")) return console.log(JSON.stringify({ hits, graph }, null, 2));
+  if (args.has("--json")) return console.log(JSON.stringify({ hits, graph, page, more }, null, 2));
   for (const { hit, score, via, relevance } of hits) {
     console.log(`\n── ${hit.title}  [${hit.documentId} #${hit.chunkIndex}]`);
     console.log(`   ${relevance !== undefined ? `relevance ${relevance.toFixed(2)} · ` : ""}score ${score.toFixed(3)} ${via.join("")}${hit.category ? ` · #${hit.category}` : ""}${hit.salience !== undefined ? ` · salience ${Number(hit.salience).toFixed(2)}` : ""}`);
@@ -999,8 +1268,9 @@ async function search(args: Args) {
     console.log("\n── related passages (judged: same event / newer statement / same matter)");
     for (const row of graph.related.slice(0, 8)) console.log(`   ${String(row.relation).toLowerCase().padEnd(10)} ${row.title}  [${row.documentId} #${row.chunkIndex}]`);
   }
-  if (!hits.length) console.log("nothing found");
-  console.log(`\n${((Date.now() - started) / 1000).toFixed(1)}s${usage.jevCalls ? ` · ${usage.jevCalls} jev calls` : ""}`);
+  if (!hits.length) console.log(page > 1 ? "no more results" : "nothing found");
+  console.log(`\npage ${page}${more ? ` · more: --page ${page + 1}` : " · end of results"}`);
+  console.log(`${((Date.now() - started) / 1000).toFixed(1)}s${usage.jevCalls ? ` · ${usage.jevCalls} jev calls` : ""}`);
 }
 
 // Helix EXAMPLES §10, bounded: what each hit is about, and the other chunks reached through the same entities.
@@ -1091,7 +1361,7 @@ async function stats() {
 // A backup is a readable copy of the graph's judgement layer: every entity, every link with its endpoints and
 // confidence, every chunk's judged properties. Prune and vet only ever work from one, so nothing is deleted that is
 // not already on disk. Node and edge ids are stable, so a backup is also the work list.
-const BACKUPS = join(import.meta.dir, "backup");
+const BACKUPS = expandHome(process.env.KB_BACKUPS ?? join(import.meta.dir, "backup"));
 const jsonl = <T>(path: string): T[] => existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as T) : [];
 const latestBackup = (args: Args) => {
   const dir = args.values("--from")[0] ?? readdirSync(BACKUPS, { withFileTypes: true }).filter((entry) => entry.isDirectory() && existsSync(join(BACKUPS, entry.name, "chunk_mentions.jsonl"))).map((entry) => join(BACKUPS, entry.name)).sort((x, y) => statSync(x).mtimeMs - statSync(y).mtimeMs).pop();   // newest
@@ -1141,9 +1411,14 @@ async function dropEdges(ids: number[], label: string) {
   }
 }
 async function dropNodes(ids: number[], label: string) {
-  for (let start = 0; start < ids.length; start += 400) {
-    await write(writeBatch().varAs("gone", g().n(ids.slice(start, start + 400)).drop()).returning([]), label);
-    console.log(`  ${label}: ${Math.min(ids.length, start + 400)}/${ids.length}`);
+  for (let start = 0; start < ids.length; start += 100) {
+    const page = ids.slice(start, start + 100);
+    const data = await read<{ rows: { entityKey: string }[] | null }>(readBatch().varAs("rows", g().n(page).project(fields("entityKey"))).returning(["rows"]), "entity_keys_to_drop");
+    const keys = (data.rows ?? []).map((row) => row.entityKey).filter(Boolean);
+    let batch: any = writeBatch();
+    if (keys.length) batch = batch.varAs("shadows", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", keys)).where(tenantScope).drop());
+    await write(batch.varAs("gone", g().n(page).drop()).returning([]), label);
+    console.log(`  ${label}: ${Math.min(ids.length, start + 100)}/${ids.length}`);
   }
 }
 
@@ -1183,7 +1458,7 @@ async function prune(args: Args) {
 // ---------------------------------------------------------------- the rest of Helix's memory model
 //
 // Helix's memory-system model, mapped onto a corpus whose unit of knowledge is the Chunk (atomic Memory nodes were
-// dropped on example's call). kb model [--from dir] [--yes] builds, idempotently:
+// omitted). kb model [--from dir] [--yes] builds, idempotently:
 //   User -OWNS-> SourceDocument                      who the corpus belongs to
 //   User -HAS_PROFILE-> UserProfile                  static facts + current focus, written by the LLM from the most salient passages about the owner
 //   Category -PARENT_OF-> Category                   the 44 leaf categories grouped under a few parents (one LLM call)
@@ -1200,7 +1475,7 @@ async function model(args: Args) {
   if (apply) {
     await dropAll("OWNS");
     await write(writeBatch().varAs("found", g().nWithLabelWhere("User", SourcePredicate.eq("userId", USER)).where(tenantScope).limit(1))
-      .varAsIf("made", BatchCondition.varEmpty("found"), g().addN("User", { tenant_id: TENANT, userId: USER, name: "the owner", createdAt: Expr.datetime() })).returning([]), "model_user");
+      .varAsIf("made", BatchCondition.varEmpty("found"), g().addN("User", { tenant_id: TENANT, userId: USER, name: OWNER_NAME, createdAt: Expr.datetime() })).returning([]), "model_user");
     for (let start = 0; start < documents.length; start += 500) {
       let batch: any = writeBatch().varAs("user", g().nWithLabelWhere("User", SourcePredicate.eq("userId", USER)).where(tenantScope).limit(1));
       documents.slice(start, start + 500).forEach((doc, index) => { batch = batch.varAs(`o${index}`, g().n(NodeRef.var("user")).addE("OWNS", doc.id, { tenant_id: TENANT })); });
@@ -1212,7 +1487,7 @@ async function model(args: Args) {
   const mine = (await read<{ rows: any[] | null }>(readBatch().varAs("rows", g().nWithLabelWhere("Chunk", Predicate.and([Predicate.eq("aboutOwner", true), Predicate.gte("salience", 0.99)])).where(tenantScope).limit(400).project(fields("chunkId", "title", "content"))).returning(["rows"]), "model_owner_passages")).rows ?? [];
   console.log(`profile: ${mine.length} dense passages about the owner → 1 LLM call over the first 16`);
   if (apply && mine.length) {
-    const profile = await llm(`You write the profile of ${USER} (the owner) for his own knowledge base, from passages about him. "static": durable facts (who he is, roles, companies, people he works with, skills, constraints) as short factual sentences. "dynamic": what he is currently working on, deciding, or worried about. Only what the passages support; no advice; no flattery. 8-20 items each.`,
+    const profile = await llm(`You write the profile of ${OWNER_NAME} (${USER}) for their own knowledge base, from passages about them. "static": durable facts (who he is, roles, companies, people he works with, skills, constraints) as short factual sentences. "dynamic": what he is currently working on, deciding, or worried about. Only what the passages support; no advice; no flattery. 8-20 items each.`,
       mine.slice(0, 16).map((row) => `=== ${row.title}\n${String(row.content).slice(0, 1800)}`).join("\n\n"), z.object({ static: z.array(z.string()), dynamic: z.array(z.string()) }));
     await write(writeBatch().varAs("old", g().nWithLabel("UserProfile").where(tenantScope).drop()).returning([]), "model_profile_drop");
     await write(writeBatch().varAs("user", g().nWithLabelWhere("User", SourcePredicate.eq("userId", USER)).where(tenantScope).limit(1))
@@ -1297,10 +1572,11 @@ async function model(args: Args) {
 async function dedupe(args: Args) {
   const dir = latestBackup(args);
   const chunks = jsonl<{ $id: number; documentId: string }>(join(dir, "chunks.jsonl"));
-  const hashOf = new Map<number, string>(), lengthOf = new Map<number, number>();
+  const hashOf = new Map<number, string>(), lengthOf = new Map<number, number>(), wordsOf = new Map<number, string[]>();
   for (let start = 0; start < chunks.length; start += 400) {
     const data = await read<{ rows: { id: number; content: string }[] | null }>(readBatch().varAs("rows", g().n(chunks.slice(start, start + 400).map((chunk) => chunk.$id)).project([PropertyProjection.renamed("$id", "id"), ...fields("content")])).returning(["rows"]), "dedupe_texts");
-    for (const row of data.rows ?? []) { hashOf.set(Number(row.id), createHash("sha256").update((row.content ?? "").replace(/\s+/g, " ").trim()).digest("hex")); lengthOf.set(Number(row.id), (row.content ?? "").length); }
+    for (const row of data.rows ?? []) { hashOf.set(Number(row.id), createHash("sha256").update((row.content ?? "").replace(/\s+/g, " ").trim()).digest("hex")); lengthOf.set(Number(row.id), (row.content ?? "").length);
+      wordsOf.set(Number(row.id), (row.content ?? "").toLowerCase().replace(/\[\d+:\d+(:\d+)?\]|&\w+;/g, " ").replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(" ")); }
   }
   // The header passage is not content. Ingesting the same video twice writes the same transcript under two ids but
   // formats the metadata block differently, so 53 documents missed a 100% match by exactly that one passage (51 of
@@ -1323,6 +1599,39 @@ async function dedupe(args: Args) {
     const best = [...overlap].filter(([other, shared]) => shared / hashes.size >= DEDUPE_SHARE && rank(other) >= rank(documentId)).sort((a, b) => rank(b[0]) - rank(a[0]))[0];
     if (best) copies.set(documentId, best[0]);
   }
+  // The passage test is blind to a copy that was cut differently: the same transcript ingested by two pipelines has
+  // different passage boundaries, so no passage hash matches (10 of 12 Iyin Aboyeji interviews stood twice, 14 against
+  // 16 passages, measured 2026-10-12). Second test on the running text: 8-word shingles, one in eight sampled by hash,
+  // and a document is a copy when ≥80% of its sample is in another's. One pipeline stamps a time every few words
+  // ("[0:02] Flutterwave, two incredibly"), so stamps are stripped first (containment 0.09 with them, measured on three
+  // pairs). Of two copies the properly-kinded one is kept before the larger: the stamped "recovered" copy has more
+  // passages but worse text.
+  const shinglesOf = new Map<string, Set<string>>(), docsSharing = new Map<string, string[]>();
+  const ordered = [...chunks].sort((a, b) => a.$id - b.$id);
+  const textOf = new Map<string, string[]>();
+  for (const chunk of ordered) if (!copies.has(chunk.documentId) && !isHeader(chunk)) (textOf.get(chunk.documentId) ?? textOf.set(chunk.documentId, []).get(chunk.documentId)!).push(...(wordsOf.get(chunk.$id) ?? []));
+  for (const [documentId, words] of textOf) {
+    const sample = new Set<string>();
+    for (let index = 0; index + 8 <= words.length; index++) { const hash = createHash("md5").update(words.slice(index, index + 8).join(" ")).digest(); if (hash[0] % 8 === 0) sample.add(hash.toString("hex", 0, 8)); }
+    if (sample.size < 20) continue;   // too short to tell a copy from a shared phrase
+    shinglesOf.set(documentId, sample);
+    for (const shingle of sample) (docsSharing.get(shingle) ?? docsSharing.set(shingle, []).get(shingle)!).push(documentId);
+  }
+  let recut = 0;
+  const standing = (documentId: string) => (docOf.get(documentId)?.kind && docOf.get(documentId)!.kind !== "recovered" ? 2 : 0) + (documentId.startsWith("rec-") ? 0 : 1);
+  // Shared text alone is not a re-ingest: a compilation video holds 80% of a shorter one, a full FAQ holds each of its
+  // pages (57 of 244 proposals had unrelated titles, read 2026-10-12). Between two documents of equal standing the
+  // titles must agree as well; a "recovered" or kindless copy of a properly-kinded document needs no such agreement,
+  // because recovery often lost the title ("Metadata", "Impromptu Google Meet Meeting").
+  const titleKey = (documentId: string) => (docOf.get(documentId)?.title ?? "").toLowerCase().replace(/^\d+ - (meeting - )?/, "").replace(/—\s*\d{4}-\d\d-\d\d.*$/, "").replace(/[^\p{L}\p{N}]+/gu, "");
+  const sameTitle = (a: string, b: string) => { const [x, y] = [titleKey(a), titleKey(b)]; return x.length >= 8 && y.length >= 8 && (x.includes(y) || y.includes(x)); };
+  for (const [documentId, sample] of [...shinglesOf].sort((a, b) => standing(a[0]) - standing(b[0]) || a[1].size - b[1].size)) {
+    const overlap = new Map<string, number>();
+    for (const shingle of sample) for (const other of docsSharing.get(shingle)!) if (other !== documentId && !copies.has(other)) overlap.set(other, (overlap.get(other) ?? 0) + 1);
+    const best = [...overlap].filter(([other, shared]) => shared / sample.size >= RECUT_SHARE && (standing(other) > standing(documentId) || (standing(other) === standing(documentId) && sameTitle(other, documentId) && (shinglesOf.get(other)!.size > sample.size || (shinglesOf.get(other)!.size === sample.size && other > documentId))))).sort((a, b) => standing(b[0]) - standing(a[0]) || b[1] - a[1])[0];
+    if (best) { copies.set(documentId, best[0]); recut++; }
+  }
+  console.log(`   ${copies.size - recut} by identical passages · ${recut} by running text (same text, cut differently)`);
   const gone = chunks.filter((chunk) => copies.has(chunk.documentId));
   console.log(`${dir}\n${documents.length} documents · ${copies.size} are copies (≥${Math.round(DEDUPE_SHARE * 100)}% identical passages) · ${gone.length} of ${chunks.length} passages go with them`);
   const byKind: Record<string, number> = {};
@@ -1337,6 +1646,28 @@ async function dedupe(args: Args) {
     ids.slice(start, start + 25).forEach((documentId, index) => { batch = batch.varAs(`c${index}`, chunksOfDocument(documentId).drop()).varAs(`d${index}`, documentById(documentId).drop()); });
     await write(batch.returning([]), "dedupe_documents").catch(async () => { for (const documentId of ids.slice(start, start + 25)) await write(writeBatch().varAs("c", chunksOfDocument(documentId).limit(400).drop()).returning([]), "dedupe_big").then(() => write(writeBatch().varAs("c", chunksOfDocument(documentId).drop()).varAs("d", documentById(documentId).drop()).returning([]), "dedupe_big_rest")); });
     console.log(`  dedupe: ${Math.min(ids.length, start + 25)}/${ids.length} documents`);
+  }
+}
+
+// kb forget <file-with-documentIds> [--yes] — remove documents that should never have been ingested, with their
+// chunks and links. Same drop path as dedupe; ids come from a file, one per line. Dry run unless --yes.
+async function forget(args: Args) {
+  await bootstrap();
+  const file = args.positional[0];
+  if (!file) throw new Error("kb forget <file-with-documentIds> [--yes]");
+  const wanted = readFileSync(file, "utf8").split("\n").map((line) => line.trim()).filter(Boolean);
+  const present = (await read<{ rows: { documentId: string; title: string; kind: string }[] | null }>(
+    readBatch().varAs("rows", g().nWithLabelWhere("SourceDocument", Predicate.isIn("documentId", wanted)).where(tenantScope).project(fields("documentId", "title", "kind"))).returning(["rows"]), "forget_lookup")).rows ?? [];
+  console.log(`${wanted.length} ids given · ${present.length} found in the graph`);
+  for (const row of present.slice(0, 8)) console.log(`   ${row.documentId}  "${String(row.title).slice(0, 55)}" [${row.kind}]`);
+  if (!present.length) return;
+  if (!args.has("--yes")) return console.log("dry run — add --yes");
+  const ids = present.map((row) => row.documentId);
+  for (let start = 0; start < ids.length; start += 25) {
+    let batch: any = writeBatch();
+    ids.slice(start, start + 25).forEach((documentId, index) => { batch = batch.varAs(`c${index}`, chunksOfDocument(documentId).drop()).varAs(`d${index}`, documentById(documentId).drop()); });
+    await write(batch.returning([]), "forget_documents").catch(async () => { for (const documentId of ids.slice(start, start + 25)) await write(writeBatch().varAs("c", chunksOfDocument(documentId).limit(400).drop()).returning([]), "forget_big").then(() => write(writeBatch().varAs("c", chunksOfDocument(documentId).drop()).varAs("d", documentById(documentId).drop()).returning([]), "forget_big_rest")); });
+    console.log(`  forget: ${Math.min(ids.length, start + 25)}/${ids.length} documents`);
   }
 }
 
@@ -1543,7 +1874,21 @@ async function check() {
   const chunks = Number(await one("chunks", g().nWithLabel("Chunk").where(tenantScope).count()));
   line("chunks", chunks);
   const judged = Number(await one("judged", g().nWithLabelWhere("Chunk", Predicate.eq("linkVersion", LINK_VERSION)).where(tenantScope).count()));
-  line("  not judged by Jev", chunks - judged, chunks === judged);
+  const extras = bookmarkDb(expandHome(process.env.KB_BOOKMARK_DB ?? "./data/bookmarks.db"));
+  const skipPath = expandHome(process.env.KB_SKIP ?? "./data/tombstoned.json");
+  const skipValue = existsSync(skipPath) ? JSON.parse(readFileSync(skipPath, "utf8")) : [];
+  const skipped = new Set<string>((Array.isArray(skipValue) ? skipValue : Object.keys(skipValue ?? {})).map(String));
+  const sourcePath = expandHome(process.env.KB_BOOKMARKS ?? "./data/bookmarks.jsonl");
+  const articles = new Set((existsSync(sourcePath) ? jsonLines<Bookmark>(sourcePath) : [])
+    .map((row) => String(row.id ?? row.tweetId ?? ""))
+    .filter((id) => id && !skipped.has(id) && (extras.get(id)?.article_text?.trim().length ?? 0) > 200)
+    .map((id) => `x:${id}:0`));
+  const bookmarks = (await one<{ chunkId: string; linkVersion?: number }[]>("bookmark_states", g().nWithLabelWhere("Chunk", Predicate.eq("documentKind", "x_bookmark")).where(tenantScope).project(fields("chunkId", "linkVersion")))) ?? [];
+  // The fast-index one-line posts deliberately skip linking; only article bookmarks must pass the graph pipeline.
+  const exempt = bookmarks.filter((row) => !articles.has(row.chunkId) && Number(row.linkVersion ?? 0) !== LINK_VERSION).length;
+  const unjudged = chunks - judged - exempt;
+  line("  not judged by Jev (article bookmarks included)", unjudged, unjudged === 0);
+  line("  index-only bookmark exemptions", exempt);
   line("  flagged, waiting for naming", Number(await one("unnamed", g().nWithLabelWhere("Chunk", Predicate.eq("needsNaming", true)).where(tenantScope).count())));
   const links = Number(await one("links", mentions().count()));
   line("links chunk→entity", links); line("  per chunk", (links / chunks).toFixed(1));
@@ -1558,6 +1903,20 @@ async function check() {
   const rostered = (await one<{ entityKey: string }[]>("rostered", g().nWithLabel("SourceDocument").where(tenantScope).outE("MENTIONS").groupCount("entityKey"))) ?? [];
   const held = new Set([...perEntity, ...rostered].map((row) => row.entityKey)), hubs = perEntity.filter((row) => row.count > HUB);
   line("entities", entities);
+  const entityRows = (await one<{ entityKey: string; name: string; kind: string }[]>("entity_names", g().nWithLabel("Entity").where(tenantScope).project(fields("entityKey", "name", "kind")))) ?? [];
+  const shadows = (await one<{ entityKey: string; name: string; kind: string }[]>("name_shadows", g().nWithLabel("EntityName").where(tenantScope).project(fields("entityKey", "name", "kind")))) ?? [];
+  const byKey = new Map<string, { name: string; kind: string }[]>();
+  for (const shadow of shadows) byKey.set(shadow.entityKey, [...(byKey.get(shadow.entityKey) ?? []), shadow]);
+  const expected = new Set(entityRows.map((row) => row.entityKey));
+  line("  Entity keys duplicated", entityRows.length - expected.size, entityRows.length === expected.size);
+  const mismatched = entityRows.filter((row) => {
+    const copies = byKey.get(row.entityKey);
+    return copies?.length !== 1 || copies[0]?.name !== row.name || copies[0]?.kind !== row.kind;
+  });
+  const stray = shadows.filter((row) => !expected.has(row.entityKey));
+  // The shadow exists because Helix v0.0.5 cannot build Entity.name text over pre-existing Entity nodes.
+  line("  EntityName missing/duplicate/mismatched", mismatched.length, mismatched.length === 0);
+  line("  EntityName without Entity", stray.length, stray.length === 0);
   line("  held by no link and no document", Math.max(0, entities - held.size), entities - held.size <= 0);
   line("  held by one passage", perEntity.filter((row) => row.count === 1).length);
   line(`  hubs (over ${HUB} passages, not walked)`, `${hubs.length} holding ${hubs.reduce((sum, row) => sum + row.count, 0)} links`);
@@ -1605,7 +1964,7 @@ async function audit(args: Args) {
   const data = await read<{ chunks: any[] | null }>(readBatch().varAs("chunks", g().n([...new Set(sample.map((edge) => edge.$from))]).project([PropertyProjection.renamed("$id", "id"), ...fields("content")])).returning(["chunks"]), "audit_passages");
   const textOf = new Map((data.chunks ?? []).map((chunk) => [Number(chunk.id), chunk.content as string]));
   // The sample goes to a file for a reviewer that shares nothing with Jev — Claude in the session, or sol. (An LLM
-  // auditor inside the tool was dropped on example's call, 2026-09-20.) One JSON line per link: the name, Jev's
+  // auditor inside the tool is omitted.) One JSON line per link: the name, Jev's
   // confidence, and the passage with the name's surroundings first. The reviewer writes verdicts next to it.
   const file = join(BACKUPS, `audit-sample-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.jsonl`);
   writeFileSync(file, sample.map((edge, index) => {
@@ -1671,7 +2030,7 @@ async function resolveEntities(args: Args) {
     if (judged % 200 === 0) console.log(`[${new Date().toTimeString().slice(0, 8)}] ${judged}/${pending.length} pairs · ${usage.jevCalls} jev`);
   });
   // confirmed pairs → groups (a=b, b=c ⇒ one group), each merged into its best-held member
-  // Identity is the name, not the name plus a kind: "PyHarness" the project and "PyHarness" the product are one node filed
+  // Identity is the name, not the name plus a kind: "ExampleTool" the project and "ExampleTool" the product are one node filed
   // twice (the key scheme carried the kind). Shown the two kinds, Jev calls them different things (0 of 425 same-name
   // pairs reached 0.9, measured 2026-09-20), so same normalised name merges without asking; Jev decides the rest.
   const slugOf = (id: number) => entities.get(id)!.entityKey.split(":")[2];
@@ -1698,6 +2057,8 @@ async function resolveEntities(args: Args) {
     let edge = 0;
     for (const link of links) if (folded.has(link.$to) && !has.has(link.$from)) { has.add(link.$from); batch = batch.varAs(`l${edge++}`, g().n(link.$from).addE("MENTIONS", merge.keep, { tenant_id: TENANT, confidence: link.confidence, entityKey: keep.entityKey, by: link.by ?? "jev" })); }
     for (const link of documentLinks) if (folded.has(link.$to) && !rostered.has(link.$from)) { rostered.add(link.$from); batch = batch.varAs(`l${edge++}`, g().n(link.$from).addE("MENTIONS", merge.keep, { tenant_id: TENANT, confidence: link.confidence ?? 1, entityKey: keep.entityKey, evidence: link.evidence ?? "" })); }
+    const foldedKeys = merge.fold.map((id) => entities.get(id)!.entityKey);
+    batch = batch.varAs("shadows", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", foldedKeys)).where(tenantScope).drop());
     await write(batch.varAs("gone", g().n(merge.fold).drop()).returning([]), "merge_entities");
   }
   console.log(`merged. Take a new backup before running hygiene commands again (this one is now out of date).`);
@@ -1714,10 +2075,12 @@ async function raw(path: string | undefined) {
 
 const USAGE = `kb — HelixDB knowledgebase
 
-  kb search "<query>"  [filters] [--mode hybrid|vector|text] [--k N] [--top N] [--chunks] [--expand N] [--full]
-                       [--no-rerank] [--no-graph] [--json]          Jev re-ranks the candidates (~2s); --no-rerank skips it
+  kb search "<query>"  [filters] [--mode graph|hybrid|vector|text] [--k N] [--top N] [--page N] [--chunks] [--expand N] [--full]
+                       [--rerank] [--no-graph] [--json]             names (≤3 words) and --kind x_bookmark: graph + BM25, no embedding; questions: graph + BM25 + vector.
+                                                                    No Jev unless --rerank; read further with --page 2, 3, …
   kb docs              [--kind K] [--source S] [--status S] [--where ...] [--limit N]
   kb entities          [filters] [--entity-kind K] [--match S] [--top N]   what a slice of the corpus is about
+  kb entities --index-names [--yes]             dry run; backfill EntityName shadow for BM25 graph search
   kb categories        [filters]                                           how a slice is filed
   kb show <documentId>        kb stats        kb profile        kb raw [file|-]
 
@@ -1725,6 +2088,10 @@ const USAGE = `kb — HelixDB knowledgebase
   kb link [--kind K ...] [--limit N] [--dry-run] [--redo]    stage 1: Helix proposes entities, Jev decides; links under 0.8 are not written
   kb name [--kind K ...] [--limit N] [--dry-run]             stage 2: LLM names what Jev flagged as missing, Jev checks every name
   kb ingest <dir> [--kind K] [--replace]      document + chunks + links (both stages)
+  kb bookmarks [jsonl] [--labels file] [--skip file] [--ftdb file] [--replace] [--dry-run]
+                                               one cheap searchable chunk per X bookmark; --replace preserves unchanged chunks
+  kb bookmarks --graph [--dry-run] [--limit N] [--redo]
+                                               link, name and settle indexed articles (>200 chars); skip already linked unless --redo
 
   graph hygiene — always from a backup, dry run unless --yes:
   kb backup [dir]                             entities, links (with endpoints + confidence), judged chunk properties → JSONL
@@ -1733,15 +2100,16 @@ const USAGE = `kb — HelixDB knowledgebase
   kb prune [--yes]                            drop links that do not stand: under the floor, stale, duplicate pairs
   kb model [--yes]                            the rest of Helix's model: User/OWNS, UserProfile, category parents, EXTENDS/UPDATES, entity associations
   kb dedupe [--yes]                           documents that are ≥80% identical-passage copies of another → removed        no model calls
+  kb forget <file> [--yes]                    documents ingested by mistake, one documentId per line → removed        no model calls
   kb relate [--yes]                           passage↔passage RELATES_TO: the graph proposes cross-document pairs, Jev decides
   kb confirm [--yes]                          every link is judged a second time in a focused request; refuted links go
   kb consolidate [--yes]                      entity on ≥50% of a document's passages → one document link, passage copies dropped
   kb vet [--yes]                              Jev re-reads unchecked LLM links and thinly-held entities in their passages
   kb entities --resolve [--yes]               the graph proposes duplicate entities (co-occurrence), Jev decides, confirmed pairs merge
-  bun eval.ts "<note>"                        20 queries: does the graph surface useful passages plain search misses? → eval.history.jsonl
+  bun eval.ts "<note>"                        queries: does the graph surface useful passages plain search misses? → eval.history.jsonl
 
   filters (indexed chunk properties; repeat a flag for OR, different flags AND):
-    --kind K   --source S   --doc <documentId>   --category "name"   --mine (about example)   --min-salience 0.6
+    --kind K   --source S   --doc <documentId>   --category "name"   --mine (about the owner)   --min-salience 0.6
     --where 'field=v' | field!=v | field~contains | field^prefix      --with-boilerplate (hidden by default)
     --entity "name" (graph: chunks about it; repeatable = ANY)   --all-entities (chunks about EVERY one)`;
 
@@ -1751,7 +2119,7 @@ try {
   switch (command) {
     case "search": await search(args); break;
     case "docs": await docs(args); break;
-    case "entities": await (args.has("--resolve") ? resolveEntities(args) : tally(args, "entities")); break;
+    case "entities": await (args.has("--index-names") ? indexEntityNames(args) : args.has("--resolve") ? resolveEntities(args) : tally(args, "entities")); break;
     case "categories": await tally(args, "categories"); break;
     case "show": await show(args.positional[0]); break;
     case "stats": await stats(); break;
@@ -1759,6 +2127,7 @@ try {
     case "link": await linkCommand(args); break;
     case "name": await nameCommand(args); break;
     case "ingest": await ingest(args); break;
+    case "bookmarks": await bookmarks(args); break;
     case "backup": await backup(args); break;
     case "prune": await prune(args); break;
     case "vet": await vet(args); break;
@@ -1784,6 +2153,7 @@ try {
     case "consolidate": await consolidate(args); break;
     case "check": await check(); break;
     case "audit": await audit(args); break;
+    case "forget": await forget(args); break;
     case "raw": await raw(args.positional[0]); break;
     default: console.log(USAGE); process.exit(command ? 1 : 0);
   }

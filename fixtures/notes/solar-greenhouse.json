@@ -1,0 +1,11 @@
+{
+  "id": "demo:solar-greenhouse",
+  "title": "Solar greenhouse",
+  "content": "The fictional Cedar Garden uses a solar greenhouse to grow tomatoes during cool months. Ventilation opens above 28 degrees Celsius. Rainwater irrigation keeps the greenhouse beds moist without flooding the roots.",
+  "source": "synthetic",
+  "url": "https://example.invalid/solar-greenhouse",
+  "metadata": {
+    "kind": "note",
+    "source": "synthetic"
+  }
+}

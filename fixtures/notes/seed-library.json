@@ -1,0 +1,11 @@
+{
+  "id": "demo:seed-library",
+  "title": "Seed library",
+  "content": "The fictional Maple Seed Library lends tomato and bean seeds to neighborhood gardeners. Cedar Garden returns dry tomato seeds after harvest. Each seed envelope lists the variety and collection year.",
+  "source": "synthetic",
+  "url": "https://example.invalid/seed-library",
+  "metadata": {
+    "kind": "note",
+    "source": "synthetic"
+  }
+}

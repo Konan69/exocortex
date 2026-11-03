@@ -1,0 +1,11 @@
+{
+  "id": "demo:compost-soil",
+  "title": "Compost soil",
+  "content": "The fictional Cedar Garden mixes mature compost into greenhouse soil each spring. Compost improves soil structure and water retention. Fresh food scraps go into a separate compost bin until fully decomposed.",
+  "source": "synthetic",
+  "url": "https://example.invalid/compost-soil",
+  "metadata": {
+    "kind": "note",
+    "source": "synthetic"
+  }
+}

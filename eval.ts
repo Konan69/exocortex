@@ -8,20 +8,16 @@
 // Results are appended to eval.history.jsonl so runs can be compared.
 import { Client, g, readBatch, Predicate, SourcePredicate } from "@helix-db/helix-db";
 import { appendFileSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 const QUERIES = [
-  "how should I price a consulting proposal", "value based pricing versus hourly billing", "how to ask for the sale without sounding pushy",
-  "handling the objection that it is too expensive", "how to negotiate when the other side has more power", "writing a cold outreach message that gets replies",
-  "building a lead magnet", "how to structure a retainer", "fractional CTO positioning", "getting referrals from existing clients",
-  "how to beatmatch without sync", "transition from house into drum and bass", "how to use loops in a transition", "echo out effect", "what tracks did Knock2 play",
-  "preparing tracks and cue points in rekordbox", "retrieval augmented generation evaluation", "structured outputs from language models", "how to run a discovery call", "productized service offer",
+  "solar greenhouse", "rainwater tank", "compost soil", "garden sensors", "seed library", "greenhouse irrigation",
 ];
 
-const client = Client.server("http://localhost:6972");
+const client = Client.server(process.env.HELIX_URL ?? "http://localhost:6972");
 // Same Jev route kb.ts uses (OpenRouter /api/alpha/decisions); the Cloudflare gateway drops sockets under this load.
-const jevKey = process.env.OPENROUTER_API_KEY ?? JSON.parse(readFileSync(join(homedir(), ".pi/agent/auth.json"), "utf8")).openrouter.key;
+const jevKey = process.env.OPENROUTER_API_KEY;
+if (!jevKey) throw new Error("set OPENROUTER_API_KEY");
 
 // One passage per request: several passages in one Jev request leak into each other (measured 2026-09-20).
 // A dropped socket is retried like a refused request — the loop must catch throws, not only bad statuses.
@@ -29,7 +25,7 @@ async function grade(query: string, passages: string[]): Promise<number[]> {
   return Promise.all(passages.map(async (passage) => {
     if (!passage.trim()) return 0;
     for (let attempt = 0; ; attempt++) {
-      const answer = await fetch("https://openrouter.ai/api/alpha/decisions", {
+      const answer = await fetch(process.env.KB_JEV_URL ?? "https://openrouter.ai/api/alpha/decisions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${jevKey}` },
         body: JSON.stringify({ model: "typesafe/jev-1.13", state: { request: query, passage }, questions: { useful: { type: "noul", instructions: "The passage answers the request or contains information directly useful for it" } } }),
