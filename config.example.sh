@@ -29,3 +29,26 @@ export KB_LABELS="${KB_LABELS:-./data/labels.jsonl}"
 export KB_SKIP="${KB_SKIP:-./data/tombstoned.json}"
 export KB_BOOKMARK_DB="${KB_BOOKMARK_DB:-./data/bookmarks.db}"
 # KB_BACKUPS defaults to the backup directory beside kb.ts.
+
+# Reader uses fixtures/notes beside the repo by default; no private data is loaded.
+# Run: python3 reader/server.py
+# KB_READER_SOURCE overrides the note directory or supplies a bookmark JSONL file.
+# KB_READER_DB defaults to reader/data/bookmarks.db beside server.py.
+export KB_READER_HOST="${KB_READER_HOST:-127.0.0.1}"
+export KB_READER_PORT="${KB_READER_PORT:-8421}"
+
+# Export full documents, then import through the current CLI.
+# Run: python3 migrate/export_supermemory.py
+# Run: bun kb.ts ingest "${SUPERMEMORY_EXPORT_DIR:-./data/supermemory-export}"
+# SUPERMEMORY_API_KEY supplies optional Bearer authorization.
+export SUPERMEMORY_URL="${SUPERMEMORY_URL:-http://127.0.0.1:6767}"
+export SUPERMEMORY_TAG="${SUPERMEMORY_TAG:-demo}"
+export SUPERMEMORY_EXPORT_DIR="${SUPERMEMORY_EXPORT_DIR:-./data/supermemory-export}"
+export SUPERMEMORY_EXPORT_LOG="${SUPERMEMORY_EXPORT_LOG:-./data/export.log}"
+
+# Legacy v1 repair drops and recreates chunks, losing extra properties and edges.
+# It is separate from kb.ts's current v2 endpoint. --test reads without repair.
+# Run: python3 migrate/reindex_vectors.py --test
+# HELIX_API_KEY supplies optional Bearer authorization.
+export HELIX_REINDEX_URL="${HELIX_REINDEX_URL:-http://localhost:6971/v1/query}"
+export HELIX_REINDEX_LOG="${HELIX_REINDEX_LOG:-./data/reindex.log}"
