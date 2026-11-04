@@ -1,0 +1,39 @@
+{
+  "repo": "kb",
+  "accent": "#C9A2FF",
+  "hero": {
+    "command": "KB_READER_DB=/tmp/kbrun/kb.db python3 reader/server.py &",
+    "output": [
+      { "text": "Setting up database...", "style": "muted" },
+      { "text": "Database ready (6 bookmarks imported)" },
+      { "text": "Serving on http://localhost:8421/bookmarks.html", "style": "accent" },
+      { "text": "$ curl -s 'localhost:8421/api/bookmarks?search=greenhouse' | jq -r '.[].id'", "style": "muted" },
+      { "text": "demo:compost-soil" },
+      { "text": "demo:garden-sensors" },
+      { "text": "demo:greenhouse-irrigation" },
+      { "text": "demo:rainwater-tank" },
+      { "text": "demo:solar-greenhouse" }
+    ],
+    "value": "The bundled notes, served and searchable with no API keys."
+  },
+  "diagram": {
+    "direction": "TB",
+    "nodes": [
+      { "id": "notes", "label": "Notes", "sublabel": "fixtures/notes/*.json" },
+      { "id": "ingest", "label": "kb ingest", "sublabel": "4,000-char chunks" },
+      { "id": "embed", "label": "Embeddings", "sublabel": "text-embedding-3-small" },
+      { "id": "helix", "label": "HelixDB", "sublabel": "Chunk, Entity" },
+      { "id": "jev", "label": "Jev", "sublabel": "decides links" },
+      { "id": "search", "label": "kb search", "sublabel": "graph + BM25" }
+    ],
+    "edges": [
+      { "from": "notes", "to": "ingest", "label": "files" },
+      { "from": "ingest", "to": "embed", "label": "chunks" },
+      { "from": "embed", "to": "helix", "label": "vectors" },
+      { "from": "helix", "to": "jev", "label": "candidates" },
+      { "from": "jev", "to": "helix", "label": "MENTIONS" },
+      { "from": "helix", "to": "search", "label": "walk" }
+    ],
+    "primary": ["notes", "ingest", "embed", "helix", "search"]
+  }
+}
