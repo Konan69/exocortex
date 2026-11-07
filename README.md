@@ -1,5 +1,7 @@
 # kb
 
+*A memory palace for your bookmarks, where every name you have ever read about gets its own room.*
+
 A command-line knowledgebase on HelixDB that links each passage of your notes and bookmarks to the people, products and topics it discusses, so a search for a name finds the passages about it.
 
 ![A terminal starts the kb reader on the bundled fixture notes and lists the notes that mention greenhouse](docs/media/hero.gif)
