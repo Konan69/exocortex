@@ -4,7 +4,7 @@ Search your notes and bookmarks by who and what they are about.
 
 Embeddings don't find names: when I measured, a nonsense query sat at cosine distance 0.30 from the corpus, the passages that really named the entity at 0.30 to 0.33, and unrelated posts at 0.32. So `kb` builds an entity graph on HelixDB. Jev decides which people, products and topics each passage is really about, and a link is written only at confidence 0.9 or higher. A short query walks that graph and adds BM25; longer questions add vector search.
 
-![A terminal starts the kb reader on the bundled fixture notes and lists the notes that mention greenhouse](docs/media/hero.gif)
+![Explainer: on a cosine-distance axis a nonsense query (0.30), real passages (0.30 to 0.33) and unrelated posts (0.32) overlap, so no cutoff works; then Jev says yes or no to Helix's candidate entities for the fixture notes, MENTIONS edges are drawn, and kb search "solar greenhouse" walks them to two passages](docs/media/hero.gif)
 
 ## Install
 
