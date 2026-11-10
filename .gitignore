@@ -33,10 +33,15 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-# kb: backups hold private corpus text, logs are noise
+# exo: backups hold private corpus text, logs are noise
 backup/
-data/
-eval.history.jsonl
-config.local.sh
 *.log
 .impeccable
+
+# agent task files
+.claude/
+.pi/
+
+# helix instance state; helix.toml is per machine (copy helix.example.toml)
+.helix/
+helix.toml

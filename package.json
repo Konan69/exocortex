@@ -1,19 +1,24 @@
 {
-  "name": "kb",
-  "module": "index.ts",
+  "name": "exocortex",
   "type": "module",
-  "devDependencies": {
-    "@types/bun": "latest"
+  "private": true,
+  "bin": {
+    "exo": "exo.ts"
   },
-  "peerDependencies": {
-    "typescript": "^5"
+  "scripts": {
+    "exo": "bun exo.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "bun scripts/smoke.ts"
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "^3.0.53",
-    "@helix-db/helix-db": "^3",
-    "@openrouter/ai-sdk-provider": "^3.1.0",
-    "ai": "^7.0.107",
-    "zod": "^4.6.5"
+    "effect": "4.1.2",
+    "@effect/ai-openai": "4.1.2",
+    "@effect/ai-openrouter": "4.1.2",
+    "@effect/platform-bun": "4.1.2",
+    "@helix-db/helix-db": "3.1.0"
   },
-  "license": "MIT"
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
 }
