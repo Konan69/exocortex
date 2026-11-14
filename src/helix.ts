@@ -58,6 +58,8 @@ export class Helix extends Context.Service<Helix, {
     batch: WriteBatch,
     schema: S,
   ) => Effect.Effect<S["Type"], HelixError, S["DecodingServices"]>
+  /** Posts a body as given to a Helix endpoint and returns the response text: `exo query`, for agents. */
+  readonly raw: (path: "/v2/query" | "/v2/cypher" | "/v2/cypher/explain", body: string, options?: { readonly write?: boolean }) => Effect.Effect<string, HelixError>
   /** Creates every index exo relies on and waits until all are active. Run before the first write of a command. */
   readonly ensureIndexes: Effect.Effect<void, HelixError>
 }>()("exo/Helix") {
@@ -66,7 +68,6 @@ export class Helix extends Context.Service<Helix, {
     const http = yield* HttpClient.HttpClient
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const writer = yield* Semaphore.make(1)
-    const url = `${settings.helixUrl}/v2/query`
 
     const reachable = http.get(settings.helixUrl).pipe(
       Effect.timeout("1 second"),
@@ -90,11 +91,11 @@ export class Helix extends Context.Service<Helix, {
     })
     const ensureUp = yield* Effect.cached(start)
 
-    const post = (query: string, body: string, headers: Record<string, string>) =>
+    const post = (query: string, body: string, headers: Record<string, string>, path = "/v2/query") =>
       Effect.gen(function*() {
         yield* ensureUp
         const response = yield* http.execute(
-          HttpClientRequest.post(url).pipe(
+          HttpClientRequest.post(`${settings.helixUrl}${path}`).pipe(
             HttpClientRequest.setHeaders({ "content-type": "application/json", ...headers }),
             HttpClientRequest.bodyText(body, "application/json"),
           ),
@@ -138,10 +139,14 @@ export class Helix extends Context.Service<Helix, {
       }
     })
 
+    const raw = (path: "/v2/query" | "/v2/cypher" | "/v2/cypher/explain", body: string, options?: { readonly write?: boolean }) =>
+      options?.write ? writer.withPermits(1)(post(`raw ${path}`, body, { "x-helix-await-durable": "true" }, path)) : post(`raw ${path}`, body, {}, path)
+
     return Helix.of({
       read,
       write,
       writeReturning,
+      raw,
       ensureIndexes: yield* Effect.cached(ensureIndexes),
     })
   }))

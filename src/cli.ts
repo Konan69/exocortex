@@ -7,6 +7,7 @@ import * as Maintain from "./maintain.ts"
 import * as Pipeline from "./pipeline.ts"
 import type { Filters } from "./queries.ts"
 import { search } from "./search.ts"
+import * as Walk from "./walk.ts"
 
 const bool = (name: string, description = "") => Flag.Boolean(name).pipe(Flag.withDescription(description), Flag.withDefault(false))
 const many = (name: string, description: string) => Flag.String(name).pipe(Flag.withDescription(description), Flag.atLeast(0))
@@ -48,6 +49,26 @@ const searchCommand = Command.make("search", {
   query: input.query.join(" "), filters: filtersOf(input), mode: input.mode, k: input.k, top: input.top, page: Math.max(1, input.page),
   chunks: input.chunks, expand: input.expand, full: input.full, rerank: input.rerank, graph: !input.noGraph, json: input.json,
 })).pipe(Command.withDescription("hybrid graph search"))
+
+const walkCommand = Command.make("walk", {
+  name: Argument.String("name").pipe(Argument.withDescription("an entity: person, organisation, product, project, place or topic"), Argument.variadic()),
+  to: Flag.String("to").pipe(Flag.withDescription("print the shortest ASSOCIATED_WITH path to this entity"), Flag.optional),
+  hops: Flag.Int("hops").pipe(Flag.withDescription("how far out to walk (with --to: the most hops to search, default 4)"), Flag.withDefault(1)),
+  top: Flag.Int("top").pipe(Flag.withDescription("neighbours kept per hop"), Flag.withDefault(15)),
+  docs: Flag.Int("docs").pipe(Flag.withDescription("documents listed"), Flag.withDefault(10)),
+  json,
+}, (input) => Walk.walk({ ...input, name: input.name.join(" ") })).pipe(Command.withDescription("walk the entity graph: neighbours, hops, documents, paths"))
+
+const queryCommand = Command.make("query", {
+  cypher: Flag.String("cypher").pipe(Flag.withDescription("one Cypher statement; $tenant is bound"), Flag.optional),
+  ts: Flag.String("ts").pipe(Flag.withDescription("a readBatch()/writeBatch() expression on the project's Helix SDK; TENANT is bound"), Flag.optional),
+  file: Flag.String("file").pipe(Flag.withDescription("a native /v2/query JSON request"), Flag.optional),
+  params: many("param", "Cypher parameter name=value"),
+  explain: bool("explain", "plan the Cypher statement, run nothing"),
+  write: bool("write", "allow a statement that writes"),
+}, (input) => Walk.query(input)).pipe(Command.withDescription("any query against the live graph (see exo schema)"))
+
+const schemaCommand = Command.make("schema", {}, () => Walk.schema).pipe(Command.withDescription("labels, edges, indexes and counts, for writing queries"))
 
 const docsCommand = Command.make("docs", { ...filterFlags, limit: Flag.Int("limit").pipe(Flag.withDefault(50)), json },
   (input) => Browse.docs({ filters: filtersOf(input), limit: input.limit, json: input.json })).pipe(Command.withDescription("list documents"))
@@ -136,7 +157,7 @@ const withUsage = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 export const exo = Command.make("exo").pipe(
   Command.withDescription("Exocortex: a headless knowledge graph on Helix — hybrid graph RAG over documents, notes and bookmarks"),
   Command.withSubcommands([
-    searchCommand, docsCommand, showCommand, entitiesCommand, categoriesCommand, statsCommand, profileCommand, taxonomyCommand,
+    searchCommand, walkCommand, queryCommand, schemaCommand, docsCommand, showCommand, entitiesCommand, categoriesCommand, statsCommand, profileCommand, taxonomyCommand,
     ingestCommand, linkCommand, nameCommand, bookmarksCommand,
     backupCommand, checkCommand, pruneCommand, dedupeCommand, forgetCommand, modelCommand,
   ]),
