@@ -217,41 +217,38 @@ export const search = Effect.fn("search")(function*(
   // Filters build the candidate stream first; vector/BM25 then rank only those candidates (Helix prefiltering).
   const stream = yield* chunkStream(filters)
   const { post } = yield* chunkFilters(filters)
-  const vectorChannel = Effect.fnUntraced(function*() {
+  const vectorChannel = Effect.gen(function*() {
     const vector = (yield* models.embed([query]))[0]!
-    const ranked = Option.match(stream, {
+    return Option.match(stream, {
       onSome: (candidates) => candidates.vectorSearch("Chunk", "embedding", [...vector], k, TENANT),
       onNone: () => g().vectorSearchNodes("Chunk", "embedding", [...vector], k, TENANT).where(post),
-    })
-    return ["~", ranked.project(withDistance)] as const
+    }).project(withDistance)
   })
+  const textChannel = Effect.succeed(Option.match(stream, {
+    onSome: (candidates) => candidates.textSearch("Chunk", "content", query.slice(0, 200), k, TENANT),
+    onNone: () => g().textSearchNodes("Chunk", "content", query.slice(0, 200), k, TENANT).where(post),
+  }).project(hitFields))
   const channels = [
-    ...(mode === "vector" || mode === "hybrid" ? [yield* vectorChannel()] : []),
-    ...(mode !== "vector"
-      ? [["=", Option.match(stream, {
-        onSome: (candidates) => candidates.textSearch("Chunk", "content", query.slice(0, 200), k, TENANT),
-        onNone: () => g().textSearchNodes("Chunk", "content", query.slice(0, 200), k, TENANT).where(post),
-      }).project(hitFields)] as const]
-      : []),
+    ...(mode === "vector" || mode === "hybrid" ? [["~", vectorChannel] as const] : []),
+    ...(mode !== "vector" ? [["=", textChannel] as const] : []),
   ]
-  const hitsOf = (channel: string, traversal: Traversal<"terminal">) =>
-    helix.read(`search_${channel}`, readBatch().varAs("hits", traversal).returning(["hits"]), Hits).pipe(Effect.map((data) => data.hits ?? []))
-  // Independent reads: a slow channel must not cost the other its results.
+  // A failed channel (no OPENAI_API_KEY, a slow read) costs only its own list.
+  const hitsOf = (channel: string, traversal: Effect.Effect<Traversal<"terminal">, AiError.AiError, never>) =>
+    traversal.pipe(
+      Effect.flatMap((ranked) => helix.read(`search_${channel}`, readBatch().varAs("hits", ranked).returning(["hits"]), Hits)),
+      Effect.map((data) => data.hits ?? []),
+      Effect.catch((error) => Effect.as(Console.error(`(${channel} channel skipped: ${error.message.slice(0, 120)})`), [])),
+    )
   const [graphList, keywordLists] = yield* Effect.all([
     mode === "graph" || mode === "hybrid"
       ? Effect.map(graphSearch(query, filters, k), (hits) => [["G", hits] as const])
       : Effect.succeed([]),
-    Effect.forEach(channels, ([channel, traversal]) =>
-      hitsOf(channel, traversal).pipe(
-        Effect.catch((error) => Effect.as(Console.error(`(${channel} channel failed: ${error.message.slice(0, 80)})`), [])),
-        Effect.map((hits) => [channel, hits] as const),
-      ), { concurrency: "unbounded" }),
+    Effect.forEach(channels, ([channel, traversal]) => Effect.map(hitsOf(channel, traversal), (hits) => [channel, hits] as const), { concurrency: "unbounded" }),
   ], { concurrency: "unbounded" })
   const lists: Array<readonly [string, ReadonlyArray<Hit>]> = [...graphList, ...keywordLists]
   // no name and no wording matched: meaning is all that is left
   if (Option.isNone(options.mode) && mode === "graph" && !bookmarksOnly && lists.every(([, list]) => !list.length)) {
-    const [channel, traversal] = yield* vectorChannel()
-    lists.push([channel, yield* hitsOf(channel, traversal)])
+    lists.push(["~", yield* hitsOf("~", vectorChannel)])
   }
 
   // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them.
