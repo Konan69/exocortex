@@ -81,6 +81,31 @@ const namedIn = (query: string, names: ReadonlyArray<{ readonly entityKey: Entit
   return Arr.dedupe([...Arr.sort(exact, Order.flip(Order.mapInput(Order.Number, length))), ...containsQuery])
 }
 
+// Helix BM25 matches whole tokens and does not stem, so "transcribing" never meets "transcribes". Every content word
+// goes in with its common English inflections; a variant that is not a word matches nothing.
+const inflections = (word: string): ReadonlyArray<string> => {
+  if (word.length < 4 || /\d/.test(word)) return [word]
+  const stems = new Set<string>()
+  if (word.endsWith("ies")) stems.add(`${word.slice(0, -3)}y`)
+  else if (word.endsWith("ing")) {
+    const stem = word.slice(0, -3)
+    stems.add(stem).add(`${stem}e`)
+    if (/([^aeiou])\1$/.test(stem)) stems.add(stem.slice(0, -1))
+  } else if (word.endsWith("ed")) stems.add(word.slice(0, -2)).add(word.slice(0, -1))
+  else if (word.endsWith("es")) stems.add(word.slice(0, -2)).add(word.slice(0, -1))
+  else if (word.endsWith("s") && !word.endsWith("ss")) stems.add(word.slice(0, -1))
+  else stems.add(word)
+  const forms = new Set([word])
+  for (const stem of stems) {
+    if (stem.length < 3) continue
+    const base = stem.endsWith("e") ? stem.slice(0, -1) : stem
+    for (const form of [stem, `${stem}s`, `${stem}es`, `${base}ed`, `${base}ing`, stem.endsWith("y") ? `${stem.slice(0, -1)}ies` : stem]) forms.add(form)
+  }
+  return [...forms]
+}
+export const keywordQuery = (query: string) =>
+  Arr.dedupe(query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word && !STOPWORDS.has(word)).flatMap(inflections)).join(" ").slice(0, 1000)
+
 const phrasesOf = (query: string) => {
   const words = normalise(query).split("-").filter(Boolean)
   const phrases: Array<string> = []
@@ -249,13 +274,16 @@ export const search = Effect.fn("search")(function*(
       onNone: () => g().vectorSearchNodes("Chunk", "embedding", [...vector], k, TENANT).where(post),
     }).project(withDistance)
   })
-  const textChannel = Effect.succeed(Option.match(stream, {
-    onSome: (candidates) => candidates.textSearch("Chunk", "content", query.slice(0, 200), k, TENANT),
-    onNone: () => g().textSearchNodes("Chunk", "content", query.slice(0, 200), k, TENANT).where(post),
+  const textChannel = (text: string) => Effect.succeed(Option.match(stream, {
+    onSome: (candidates) => candidates.textSearch("Chunk", "content", text, k, TENANT),
+    onNone: () => g().textSearchNodes("Chunk", "content", text, k, TENANT).where(post),
   }).project(hitFields))
+  const inflected = keywordQuery(query)
   const channels = [
     ...(mode === "vector" || mode === "hybrid" ? [["~", vectorChannel] as const] : []),
-    ...(mode !== "vector" ? [["=", textChannel] as const] : []),
+    ...(mode !== "vector" ? [["=", textChannel(query.slice(0, 200))] as const] : []),
+    // a second keyword list with every word's inflections: finds "transcribes" for "transcribing" without reordering the first
+    ...(mode !== "vector" && inflected !== query.toLowerCase().trim() ? [["≈", textChannel(inflected)] as const] : []),
   ]
   // A failed channel (no OPENAI_API_KEY, a slow read) costs only its own list.
   const hitsOf = (channel: string, traversal: Effect.Effect<Traversal<"terminal">, AiError.AiError, never>) =>
