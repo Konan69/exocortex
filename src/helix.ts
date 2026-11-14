@@ -22,6 +22,7 @@ const INDEXES: ReadonlyArray<readonly [string, IndexSpec]> = [
   ["doc_status", IndexSpec.nodeEquality("SourceDocument", "status")],
   ["doc_kind", IndexSpec.nodeEquality("SourceDocument", "kind")],
   ["doc_source", IndexSpec.nodeEquality("SourceDocument", "source")],
+  ["doc_title_txt", IndexSpec.nodeText("SourceDocument", "title", "tenant_id")],
   ["chunk_doc", IndexSpec.nodeEquality("Chunk", "documentId")],
   ["chunk_id", IndexSpec.nodeEquality("Chunk", "chunkId")],
   ["chunk_kind", IndexSpec.nodeEquality("Chunk", "documentKind")],

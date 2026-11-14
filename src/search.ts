@@ -292,13 +292,31 @@ export const search = Effect.fn("search")(function*(
       Effect.map((data) => data.hits ?? []),
       Effect.catch((error) => Effect.as(Console.error(`(${channel} channel skipped: ${error.message.slice(0, 120)})`), [])),
     )
+  // Titles say what a document is about ("Georgiy <> Konan: 1-1"); each matching document is represented by its
+  // first passage that passes the filters.
+  const titleChannel = Effect.gen(function*() {
+    const DocIds = Schema.Struct({ d: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: DocumentId }))) })
+    const ranked = yield* helix.read("search_titles", readBatch().varAs("d", g().textSearchNodes("SourceDocument", "title", query.slice(0, 200), k, TENANT).project(fields("documentId"))).returning(["d"]), DocIds)
+    const ids = Arr.dedupe((ranked.d ?? []).map((row) => row.documentId))
+    if (!ids.length) return []
+    const { anchor } = yield* chunkFilters(filters)
+    const opening = yield* helix.read(
+      "search_title_passages",
+      readBatch().varAs("c", g().nWithLabelWhere("Chunk", Predicate.and([Predicate.isIn("documentId", ids), ...anchor])).where(Predicate.and([post, Predicate.lte("chunkIndex", 2)])).project(hitFields)).returning(["c"]),
+      Schema.Struct({ c: Schema.NullOr(Schema.Array(Hit)) }),
+    )
+    const first = new Map<string, Hit>()
+    for (const hit of Arr.sort(opening.c ?? [], Order.mapInput(Order.Number, (row: Hit) => row.chunkIndex))) if (!first.has(hit.documentId)) first.set(hit.documentId, hit)
+    return Arr.getSomes(ids.map((id) => Option.fromNullishOr(first.get(id))))
+  }).pipe(Effect.catch((error) => Effect.as(Console.error(`(T channel skipped: ${error.message.slice(0, 120)})`), [] as ReadonlyArray<Hit>)))
   const [graphList, keywordLists] = yield* Effect.all([
     mode === "graph" || mode === "hybrid"
       ? Effect.map(graphSearch(query, filters, k), (hits) => [["G", hits] as const])
       : Effect.succeed([]),
     Effect.forEach(channels, ([channel, traversal]) => Effect.map(hitsOf(channel, traversal), (hits) => [channel, hits] as const), { concurrency: "unbounded" }),
   ], { concurrency: "unbounded" })
-  const lists: Array<readonly [string, ReadonlyArray<Hit>]> = [...graphList, ...keywordLists]
+  const titleList = mode === "vector" ? [] : [["T", yield* titleChannel] as const]
+  const lists: Array<readonly [string, ReadonlyArray<Hit>]> = [...graphList, ...keywordLists, ...titleList]
   // no name and no wording matched: meaning is all that is left
   if (Option.isNone(options.mode) && mode === "graph" && !bookmarksOnly && lists.every(([, list]) => !list.length)) {
     lists.push(["~", yield* hitsOf("~", vectorChannel)])

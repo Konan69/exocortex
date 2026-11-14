@@ -177,7 +177,7 @@ edges
   Chunk -RELATES_TO | EXTENDS | UPDATES-> Chunk
 indexes   equality: SourceDocument.documentId/kind/source/status, Chunk.documentId/chunkId/documentKind/source/category/aboutOwner,
           Entity.entityKey, EntityName.entityKey(unique), Category.categoryKey(unique)   range: Chunk.salience
-          vector: Chunk.embedding (cosine, tenant_id)   BM25: Chunk.content, EntityName.name (tenant_id)
+          vector: Chunk.embedding (cosine, tenant_id)   BM25: Chunk.content, SourceDocument.title, EntityName.name (tenant_id)
 query     exo query --cypher 'MATCH (e:Entity {entityKey: $tenant + ":person:ada-lovelace"})-[r:ASSOCIATED_WITH]-(n) RETURN n.name, r.passages'
           exo query --ts 'readBatch().varAs("n", g().nWithLabelWhere("Entity", SourcePredicate.eq("entityKey", TENANT + ":topic:rag")).in("MENTIONS").count()).returning(["n"])'
           Cypher has no variable-length paths, shortestPath, vector or BM25; use exo walk / exo search for those.`
