@@ -73,7 +73,7 @@ export class Helix extends Context.Service<Helix, {
       Effect.as(true),
       Effect.catch(() => Effect.succeed(false)),
     )
-    // The local instance is the `dev` instance of the Helix CLI project in helix.toml (disk storage on MinIO). Its
+    // The local instance is the `dev` instance of the Helix CLI project in helix.toml (disk storage on SeaweedFS). Its
     // containers have restart policy `no`, so they are off after a WSL boot; `helix start` brings them back on the
     // same volume. The CLI can report "not ready" while the server is fine, so readiness is judged by asking Helix.
     const start = Effect.gen(function*() {

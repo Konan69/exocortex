@@ -172,7 +172,7 @@ Quality, last measured (2026-09-20, 2,595 docs, 20,509 links): search top-8 0.88
   `g().dropEdgeById(...)`. Node `.drop()` cascades its edges. `outN()` of an out-edge is its target, `inN()` its source.
 - ≤512 text-indexed node mutations per write; index DDL cannot share a batch with data; one writer (concurrent writes
   answer 409, so `Helix.write` serializes them); a full scan of every link is 20-90 s.
-- Storage is SlateDB on the MinIO bucket `helix-db`; text and vector indexes live there too.
+- Storage is SlateDB on the SeaweedFS bucket `helix-db` (CLI 3.7+, image v0.0.16; older MinIO volumes need the copy in Helix's "Migrate MinIO disk data" guide). Text and vector indexes live there too.
 
 ## Open
 

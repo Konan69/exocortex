@@ -45,3 +45,4 @@ backup/
 # helix instance state; helix.toml is per machine (copy helix.example.toml)
 .helix/
 helix.toml
+.audit/
