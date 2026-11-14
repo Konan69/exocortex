@@ -276,12 +276,20 @@ export const search = Effect.fn("search")(function*(
     lists.push(["~", yield* hitsOf("~", vectorChannel)])
   }
 
-  // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them.
-  const fused = new Map<number, { hit: Hit; score: number; via: Array<string> }>()
+  // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them. Results
+  // are per document unless --chunks, so fusion is too: a document's best rank in each list counts, and the passage
+  // shown is the one with the best single rank.
+  const keyOf = (hit: Hit) => options.chunks ? String(hit.id) : hit.documentId
+  const fused = new Map<string, { hit: Hit; best: number; score: number; via: Array<string> }>()
   for (const [channel, list] of lists) {
+    const seen = new Set<string>()
     list.forEach((hit, rank) => {
-      const entry = fused.get(hit.id) ?? { hit, score: 0, via: [] }
-      fused.set(hit.id, { hit: entry.hit, score: entry.score + 1 / (60 + rank + 1), via: [...entry.via, channel] })
+      const key = keyOf(hit)
+      if (seen.has(key)) return
+      seen.add(key)
+      const contribution = 1 / (60 + rank + 1)
+      const entry = fused.get(key) ?? { hit, best: 0, score: 0, via: [] }
+      fused.set(key, { hit: contribution > entry.best ? hit : entry.hit, best: Math.max(entry.best, contribution), score: entry.score + contribution, via: [...entry.via, channel] })
     })
   }
   const byScore = Order.flip(Order.mapInput(Order.Number, (entry: Ranked) => entry.score))
@@ -302,7 +310,6 @@ export const search = Effect.fn("search")(function*(
       }), { concurrency: "unbounded" })
     ranked = [...Arr.sort(judged, byScore), ...ranked.slice(pool.length)]
   }
-  if (!options.chunks) ranked = Arr.dedupeWith(ranked, (a, b) => a.hit.documentId === b.hit.documentId)
   const more = ranked.length > page * top
   const paged = ranked.slice((page - 1) * top, page * top)
   const contents = options.expand && paged.length ? yield* neighbours(paged.map((entry) => entry.hit), options.expand) : paged.map((entry) => entry.hit)
