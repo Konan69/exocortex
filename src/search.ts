@@ -129,23 +129,20 @@ const graphSearch = Effect.fnUntraced(function*(query: string, filters: Filters,
       batch.varAs(
         `p${index}`,
         g().n(id).in("MENTIONS").union([sub().hasLabel("Chunk"), sub().hasLabel("SourceDocument").out("HAS_CHUNK")])
-          .where(filter).dedup().limit(Math.max(k * 8, 80)).project(hitFields),
+          .where(filter).dedup().textSearch("Chunk", "content", query.slice(0, 200), k, TENANT).project(hitFields),
       ), readBatch()).returning(entities.map((_, index) => `p${index}`)),
     Vars(Hit),
   )
-  // Each entity's passages count 1/(rank+1), the entity's place in the name match.
-  const tally = new Map<number, { hit: Hit; weight: number; matches: number }>()
-  entities.forEach((_, rank) => {
-    for (const hit of reached[`p${rank}`] ?? []) {
-      const entry = tally.get(hit.id) ?? { hit, weight: 0, matches: 0 }
-      tally.set(hit.id, { hit: entry.hit, weight: entry.weight + 1 / (rank + 1), matches: entry.matches + 1 })
+  // Each entity's passages arrive ranked by BM25 on the query within them; a passage about several named entities
+  // collects from each list.
+  const tally = new Map<number, { hit: Hit; weight: number }>()
+  entities.forEach((_, index) => {
+    for (const [rank, hit] of (reached[`p${index}`] ?? []).entries()) {
+      const entry = tally.get(hit.id) ?? { hit, weight: 0 }
+      tally.set(hit.id, { hit: entry.hit, weight: entry.weight + 1 / (60 + rank + 1) })
     }
   })
-  return Arr.sortBy(
-    Order.flip(Order.mapInput(Order.Number, (row: { weight: number }) => row.weight)),
-    Order.flip(Order.mapInput(Order.Number, (row: { matches: number }) => row.matches)),
-    Order.flip(Order.mapInput(Order.Number, (row: { hit: Hit }) => row.hit.salience ?? 0)),
-  )([...tally.values()]).slice(0, k).map((row) => row.hit)
+  return Arr.sort([...tally.values()], Order.flip(Order.mapInput(Order.Number, (row: { weight: number }) => row.weight))).slice(0, k).map((row) => row.hit)
 })
 
 // Helix EXAMPLES §10, bounded: what each hit is about, and the other chunks reached through the same entities.
