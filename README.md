@@ -18,7 +18,7 @@ Bun 1.3, Docker, and the [Helix CLI](https://github.com/HelixDB/helix-db) (`heli
 ```bash
 git clone https://github.com/Konan69/exocortex && cd exocortex
 bun install --frozen-lockfile
-cp .env.example .env              # owner, tenant, OPENAI_API_KEY, OPENROUTER_API_KEY
+cp .env.example .env              # owner, tenant; OPENAI_API_KEY (query vectors) and OPENROUTER_API_KEY (Jev, GLM) are read only by the commands that call a model
 cp helix.example.toml helix.toml  # the local Helix project; exo runs `helix start dev` when Helix is down
 bun exo.ts taxonomy --seed --yes  # GLM drafts the categories once; ingest files passages under them
 bun exo.ts ingest fixtures/notes  # chunk, embed, link, name, settle
@@ -40,11 +40,12 @@ bun exo.ts --help                                     # every command; `bun exo.
 | Ask | Command |
 |---|---|
 | Find passages | `search "<q>" [filters] [--mode graph\|hybrid\|vector\|text] [--top N] [--page N] [--chunks] [--expand N] [--rerank] [--json]` |
+| Walk the graph | `walk "<entity>" [--hops N] [--to "<entity>"] [--top N] [--docs N] [--json]`: neighbours by `ASSOCIATED_WITH`, hops out, the documents it runs through, the fewest-hop path to another entity |
+| Any query | `schema` (labels, edges, indexes, counts), then `query --cypher '<stmt>'` (`$tenant` bound), `query --ts 'readBatch()…'` (the project's SDK, `TENANT` bound) or `query --file q.json`; writes need `--write` |
 | Browse | `docs`, `show <documentId>`, `entities`, `categories`, `stats`, `profile`, `taxonomy` (`--seed` drafts it) |
 | Add documents | `ingest <dir>` (JSON source files), `bookmarks` (X bookmarks), `bookmarks --graph` (link the ones with articles) |
 | Repair linking | `link`, `name` (stages 1 and 2 over chunks that missed them) |
 | Keep it honest | `backup`, `check`, `prune`, `dedupe`, `forget <file>`, `entities --resolve`, `entities --index-names`, `model` |
-| Debug | `helix query dev --file q.json` (Helix CLI, from this directory) |
 
 Filters (repeat a flag for OR, different flags AND): `--kind`, `--source`, `--doc`, `--category`, `--mine` (about
 the owner), `--min-salience 0.6`, `--where 'field=v'` (`!=`, `~` contains, `^` prefix), `--with-boilerplate`, `--entity
@@ -87,6 +88,7 @@ Effect 4 throughout. `exo.ts` builds the layers and runs the CLI.
 | `src/bookmarks.ts` | the X bookmark import and graph pass |
 | `src/search.ts` | hybrid graph search |
 | `src/browse.ts` | read-only views |
+| `src/walk.ts` | `walk`, `query`, `schema`: entity neighbourhoods, paths, raw Cypher / SDK / JSON queries |
 | `src/maintain.ts` | backup, check, prune, dedupe, forget, entity resolution, the profile model |
 | `src/cli.ts` | commands and flags |
 
