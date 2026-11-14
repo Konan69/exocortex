@@ -3,7 +3,7 @@ import { g, Predicate, PropertyProjection, readBatch, SourcePredicate, sub, type
 import { Array as Arr, Clock, Console, Effect, Option, Order, Result, Schema } from "effect"
 import { type AiError, Decision } from "effect/ai"
 import { Models } from "./ai.ts"
-import { ChunkId, DocumentId, ENTITY_KINDS, EntityKey, entityKeyOf, HUB, NodeId, TENANT } from "./domain.ts"
+import { ChunkId, DocumentId, ENTITY_KINDS, EntityKey, entityKeyOf, HUB, NodeId, normalise, TENANT } from "./domain.ts"
 import { Helix, HelixError } from "./helix.ts"
 import { chunkFilters, chunksOfDocument, chunkStream, fields, type FilterError, type Filters, idAs, tenantScope } from "./queries.ts"
 
@@ -66,23 +66,51 @@ const Useful = Decision.make({
 
 // WHY: the graph holds what saved things are about; BM25 catches wording with no entity. Query embeddings and
 // Jev reranking were cut from bookmark search for speed at the owner's request.
+// Words that never name anything on their own: a one-word name match on one of these is noise.
+const STOPWORDS = new Set("a an and are as at be by can could did do does for from had has have how i in is it me my of on or our say said should so than that the their them then there these they this to was we were what when where which who why will with without would you your about into over just like more most some such".split(" "))
+
+/** Entities named in the query: every phrase of it that is exactly an entity's name, longest first, and (for a short
+ *  lookup) names that contain every word of it, so "georgiy" finds "Georgiy Sekretaryuk". */
+const namedIn = (query: string, names: ReadonlyArray<{ readonly entityKey: EntityKey; readonly name: string }>, exact: ReadonlyArray<EntityKey>) => {
+  const words = normalise(query).split("-").filter(Boolean)
+  const content = words.filter((word) => !STOPWORDS.has(word))
+  const containsQuery = content.length > 0 && content.length <= 3
+    ? names.filter((row) => { const own = new Set(normalise(row.name).split("-")); return content.every((word) => own.has(word)) }).map((row) => row.entityKey)
+    : []
+  const length = (key: EntityKey) => key.split(":").at(-1)!.split("-").length
+  return Arr.dedupe([...Arr.sort(exact, Order.flip(Order.mapInput(Order.Number, length))), ...containsQuery])
+}
+
+const phrasesOf = (query: string) => {
+  const words = normalise(query).split("-").filter(Boolean)
+  const phrases: Array<string> = []
+  for (let size = Math.min(5, words.length); size >= 1; size--) {
+    for (let start = 0; start + size <= words.length; start++) {
+      const phrase = words.slice(start, start + size)
+      if (size === 1 && STOPWORDS.has(phrase[0]!)) continue
+      phrases.push(phrase.join(" "))
+    }
+  }
+  return phrases
+}
+
 const graphSearch = Effect.fnUntraced(function*(query: string, filters: Filters, k: number) {
   const helix = yield* Helix
-  const keys = ENTITY_KINDS.map((kind) => entityKeyOf(kind, query))
-  const KeyRows = Schema.NullOr(Schema.Array(Schema.Struct({ entityKey: EntityKey })))
+  const keys = Arr.dedupe(phrasesOf(query).flatMap((phrase) => ENTITY_KINDS.map((kind) => entityKeyOf(kind, phrase))))
+  const NameRows = Schema.NullOr(Schema.Array(Schema.Struct({ entityKey: EntityKey, name: Schema.String })))
   const found = yield* helix.read(
     "search_graph_names",
     readBatch()
-      .varAs("names", g().textSearchNodes("EntityName", "name", query.slice(0, 200), 16, TENANT).project(fields("entityKey")))
-      .varAs("exact", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", keys)).where(tenantScope).project(fields("entityKey")))
+      .varAs("names", g().textSearchNodes("EntityName", "name", query.slice(0, 200), 16, TENANT).project(fields("entityKey", "name")))
+      .varAs("exact", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", keys)).where(tenantScope).project(fields("entityKey", "name")))
       .returning(["names", "exact"]),
-    Schema.Struct({ names: KeyRows, exact: KeyRows }),
+    Schema.Struct({ names: NameRows, exact: NameRows }),
   ).pipe(Effect.mapError((error) =>
     error.message.includes("missing Node text index")
       ? new SearchError({ message: "EntityName BM25 index missing — run `exo entities --index-names --yes` (Helix must build the empty-label index first)" })
       : error
   ))
-  const orderedKeys = Arr.dedupe([...(found.exact ?? []), ...(found.names ?? [])].map((row) => row.entityKey)).slice(0, 8)
+  const orderedKeys = namedIn(query, found.names ?? [], (found.exact ?? []).map((row) => row.entityKey)).slice(0, 8)
   if (!orderedKeys.length) return []
   const mapped = yield* helix.read(
     "search_graph_entity_keys",
