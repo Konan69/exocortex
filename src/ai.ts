@@ -6,8 +6,8 @@
 // usage report a command prints at the end.
 import { OpenAiClient, OpenAiEmbeddingModel } from "@effect/ai-openai"
 import { OpenRouterClient, OpenRouterDecisionModel, OpenRouterLanguageModel } from "@effect/ai-openrouter"
-import { Array as Arr, type Cause, Config, Context, Effect, Layer, Ref, Schedule, Schema, Semaphore } from "effect"
-import { type AiError, type Decision, DecisionModel, EmbeddingModel, LanguageModel } from "effect/ai"
+import { Array as Arr, type Cause, Config, Context, Effect, Layer, Option, Ref, Schedule, Schema, Semaphore } from "effect"
+import { AiError, type Decision, DecisionModel, EmbeddingModel, LanguageModel } from "effect/ai"
 import { FetchHttpClient } from "effect/http"
 import { Settings } from "./config.ts"
 
@@ -27,6 +27,14 @@ const noUsage: Usage = { decisions: 0, decisionTokens: 0, decisionCost: 0, gener
 const DECISION_GAP = "100 millis"
 const EMBED_BATCH = 64
 const retryTransient = { schedule: Schedule.exponential("600 millis"), times: 8, while: (error: AiError.AiError) => error.isRetryable }
+
+// Keys are read when a model is first called, not when exo starts: search, walk and browse need no model.
+const optionalKey = (name: string) => Config.Redacted(name).pipe(Config.option, Config.map(Option.getOrUndefined))
+const requireKey = (name: string, method: string) =>
+  Effect.gen(function*() {
+    if (Option.isSome(yield* Config.option(Config.Redacted(name)).pipe(Effect.orDie))) return
+    return yield* AiError.make({ module: "exo/Models", method, reason: new AiError.AuthenticationError({ kind: "MissingKey", description: `set ${name}` }) })
+  })
 
 export class Models extends Context.Service<Models, {
   /** Answers every decision it can; a refused or invalid decision is an `Unanswered` outcome, not a failure. */
@@ -61,6 +69,7 @@ export class Models extends Context.Service<Models, {
       input: Input["Type"],
     ) =>
       Effect.gen(function*() {
+        yield* requireKey("OPENROUTER_API_KEY", "decide")
         yield* startGate.withPermits(1)(Effect.sleep(DECISION_GAP))
         const response = yield* decisions.decideSettled(definition, { input })
         yield* add({ decisions: 1, decisionTokens: response.usage.inputTokens ?? 0, decisionCost: response.metadata?.openrouter?.cost ?? 0 })
@@ -74,6 +83,7 @@ export class Models extends Context.Service<Models, {
       readonly schema: S
     }) =>
       Effect.gen(function*() {
+        yield* requireKey("OPENROUTER_API_KEY", "generate")
         const response = yield* writer.generateObject({
           objectName: options.name,
           schema: options.schema,
@@ -84,12 +94,12 @@ export class Models extends Context.Service<Models, {
       }).pipe(Effect.timeout(settings.writerTimeoutMillis), Effect.retry({ times: 2 }), writeSlots.withPermits(1))
 
     const embed = (texts: ReadonlyArray<string>) =>
-      Effect.forEach(Arr.chunksOf(texts, EMBED_BATCH), (batch) =>
+      requireKey("OPENAI_API_KEY", "embed").pipe(Effect.andThen(Effect.forEach(Arr.chunksOf(texts, EMBED_BATCH), (batch) =>
         embeddings.embedMany(batch).pipe(
           Effect.retry(retryTransient),
           Effect.tap(() => add({ embedded: batch.length })),
           Effect.map((response) => response.embeddings.map((embedding) => embedding.vector)),
-        )).pipe(Effect.map(Arr.flatten))
+        )).pipe(Effect.map(Arr.flatten))))
 
     return Models.of({ decide, generate, embed, usage: Ref.get(usage) })
   }))
@@ -104,8 +114,8 @@ export class Models extends Context.Service<Models, {
         OpenAiEmbeddingModel.model(settings.embeddingModel, { dimensions: settings.dimensions }),
       ]),
       Layer.provide([
-        OpenRouterClient.layerConfig({ apiKey: Config.Redacted("OPENROUTER_API_KEY") }),
-        OpenAiClient.layerConfig({ apiKey: Config.Redacted("OPENAI_API_KEY") }),
+        OpenRouterClient.layerConfig({ apiKey: optionalKey("OPENROUTER_API_KEY") }),
+        OpenAiClient.layerConfig({ apiKey: optionalKey("OPENAI_API_KEY") }),
       ]),
       Layer.provide(FetchHttpClient.layer),
     )

@@ -3,7 +3,7 @@ import { g, Predicate, PropertyProjection, readBatch, SourcePredicate, sub, type
 import { Array as Arr, Clock, Console, Effect, Option, Order, Result, Schema } from "effect"
 import { type AiError, Decision } from "effect/ai"
 import { Models } from "./ai.ts"
-import { ChunkId, DocumentId, ENTITY_KINDS, EntityKey, entityKeyOf, HUB, NodeId, TENANT } from "./domain.ts"
+import { ChunkId, DocumentId, ENTITY_KINDS, EntityKey, entityKeyOf, HUB, NodeId, normalise, TENANT } from "./domain.ts"
 import { Helix, HelixError } from "./helix.ts"
 import { chunkFilters, chunksOfDocument, chunkStream, fields, type FilterError, type Filters, idAs, tenantScope } from "./queries.ts"
 
@@ -12,9 +12,9 @@ export type SearchMode = "graph" | "hybrid" | "vector" | "text"
 export interface SearchOptions {
   readonly query: string
   readonly filters: Filters
-  /** default: graph for lookups of ≤3 words and bookmark-only searches, hybrid otherwise */
+  /** default hybrid: every list runs and RRF decides; the others leave lists out to compare */
   readonly mode: Option.Option<SearchMode>
-  /** candidates per channel; default max(24, page × top × 3) */
+  /** candidates per channel; default max(60, page × top × 3) */
   readonly k: Option.Option<number>
   readonly top: number
   readonly page: number
@@ -66,23 +66,76 @@ const Useful = Decision.make({
 
 // WHY: the graph holds what saved things are about; BM25 catches wording with no entity. Query embeddings and
 // Jev reranking were cut from bookmark search for speed at the owner's request.
+// Words that never name anything on their own: a one-word name match on one of these is noise.
+const STOPWORDS = new Set("a an and are as at be by can could did do does for from had has have how i in is it me my of on or our say said should so than that the their them then there these they this to was we were what when where which who why will with without would you your about into over just like more most some such".split(" "))
+
+/** Entities named in the query: every phrase of it that is exactly an entity's name, longest first, and names that
+ *  contain every word of it, so "georgiy" finds "Georgiy Sekretaryuk". */
+const namedIn = (query: string, names: ReadonlyArray<{ readonly entityKey: EntityKey; readonly name: string }>, exact: ReadonlyArray<EntityKey>) => {
+  const words = normalise(query).split("-").filter(Boolean)
+  const content = words.filter((word) => !STOPWORDS.has(word))
+  const containsQuery = content.length > 0
+    ? names.filter((row) => { const own = new Set(normalise(row.name).split("-")); return content.every((word) => own.has(word)) }).map((row) => row.entityKey)
+    : []
+  const length = (key: EntityKey) => key.split(":").at(-1)!.split("-").length
+  return Arr.dedupe([...Arr.sort(exact, Order.flip(Order.mapInput(Order.Number, length))), ...containsQuery])
+}
+
+// Helix BM25 matches whole tokens and does not stem, so "transcribing" never meets "transcribes". Every content word
+// goes in with its common English inflections; a variant that is not a word matches nothing.
+const inflections = (word: string): ReadonlyArray<string> => {
+  if (word.length < 4 || /\d/.test(word)) return [word]
+  const stems = new Set<string>()
+  if (word.endsWith("ies")) stems.add(`${word.slice(0, -3)}y`)
+  else if (word.endsWith("ing")) {
+    const stem = word.slice(0, -3)
+    stems.add(stem).add(`${stem}e`)
+    if (/([^aeiou])\1$/.test(stem)) stems.add(stem.slice(0, -1))
+  } else if (word.endsWith("ed")) stems.add(word.slice(0, -2)).add(word.slice(0, -1))
+  else if (word.endsWith("es")) stems.add(word.slice(0, -2)).add(word.slice(0, -1))
+  else if (word.endsWith("s") && !word.endsWith("ss")) stems.add(word.slice(0, -1))
+  else stems.add(word)
+  const forms = new Set([word])
+  for (const stem of stems) {
+    if (stem.length < 3) continue
+    const base = stem.endsWith("e") ? stem.slice(0, -1) : stem
+    for (const form of [stem, `${stem}s`, `${stem}es`, `${base}ed`, `${base}ing`, stem.endsWith("y") ? `${stem.slice(0, -1)}ies` : stem]) forms.add(form)
+  }
+  return [...forms]
+}
+export const keywordQuery = (query: string) =>
+  Arr.dedupe(query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word && !STOPWORDS.has(word)).flatMap(inflections)).join(" ").slice(0, 1000)
+
+const phrasesOf = (query: string) => {
+  const words = normalise(query).split("-").filter(Boolean)
+  const phrases: Array<string> = []
+  for (let size = Math.min(5, words.length); size >= 1; size--) {
+    for (let start = 0; start + size <= words.length; start++) {
+      const phrase = words.slice(start, start + size)
+      if (size === 1 && STOPWORDS.has(phrase[0]!)) continue
+      phrases.push(phrase.join(" "))
+    }
+  }
+  return phrases
+}
+
 const graphSearch = Effect.fnUntraced(function*(query: string, filters: Filters, k: number) {
   const helix = yield* Helix
-  const keys = ENTITY_KINDS.map((kind) => entityKeyOf(kind, query))
-  const KeyRows = Schema.NullOr(Schema.Array(Schema.Struct({ entityKey: EntityKey })))
+  const keys = Arr.dedupe(phrasesOf(query).flatMap((phrase) => ENTITY_KINDS.map((kind) => entityKeyOf(kind, phrase))))
+  const NameRows = Schema.NullOr(Schema.Array(Schema.Struct({ entityKey: EntityKey, name: Schema.String })))
   const found = yield* helix.read(
     "search_graph_names",
     readBatch()
-      .varAs("names", g().textSearchNodes("EntityName", "name", query.slice(0, 200), 16, TENANT).project(fields("entityKey")))
-      .varAs("exact", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", keys)).where(tenantScope).project(fields("entityKey")))
+      .varAs("names", g().textSearchNodes("EntityName", "name", query.slice(0, 200), 16, TENANT).project(fields("entityKey", "name")))
+      .varAs("exact", g().nWithLabelWhere("EntityName", Predicate.isIn("entityKey", keys)).where(tenantScope).project(fields("entityKey", "name")))
       .returning(["names", "exact"]),
-    Schema.Struct({ names: KeyRows, exact: KeyRows }),
+    Schema.Struct({ names: NameRows, exact: NameRows }),
   ).pipe(Effect.mapError((error) =>
     error.message.includes("missing Node text index")
       ? new SearchError({ message: "EntityName BM25 index missing — run `exo entities --index-names --yes` (Helix must build the empty-label index first)" })
       : error
   ))
-  const orderedKeys = Arr.dedupe([...(found.exact ?? []), ...(found.names ?? [])].map((row) => row.entityKey)).slice(0, 8)
+  const orderedKeys = namedIn(query, found.names ?? [], (found.exact ?? []).map((row) => row.entityKey)).slice(0, 8)
   if (!orderedKeys.length) return []
   const mapped = yield* helix.read(
     "search_graph_entity_keys",
@@ -101,23 +154,20 @@ const graphSearch = Effect.fnUntraced(function*(query: string, filters: Filters,
       batch.varAs(
         `p${index}`,
         g().n(id).in("MENTIONS").union([sub().hasLabel("Chunk"), sub().hasLabel("SourceDocument").out("HAS_CHUNK")])
-          .where(filter).dedup().limit(Math.max(k * 8, 80)).project(hitFields),
+          .where(filter).dedup().textSearch("Chunk", "content", query.slice(0, 200), k, TENANT).project(hitFields),
       ), readBatch()).returning(entities.map((_, index) => `p${index}`)),
     Vars(Hit),
   )
-  // Each entity's passages count 1/(rank+1), the entity's place in the name match.
-  const tally = new Map<number, { hit: Hit; weight: number; matches: number }>()
-  entities.forEach((_, rank) => {
-    for (const hit of reached[`p${rank}`] ?? []) {
-      const entry = tally.get(hit.id) ?? { hit, weight: 0, matches: 0 }
-      tally.set(hit.id, { hit: entry.hit, weight: entry.weight + 1 / (rank + 1), matches: entry.matches + 1 })
+  // Each entity's passages arrive ranked by BM25 on the query within them; a passage about several named entities
+  // collects from each list.
+  const tally = new Map<number, { hit: Hit; weight: number }>()
+  entities.forEach((_, index) => {
+    for (const [rank, hit] of (reached[`p${index}`] ?? []).entries()) {
+      const entry = tally.get(hit.id) ?? { hit, weight: 0 }
+      tally.set(hit.id, { hit: entry.hit, weight: entry.weight + 1 / (60 + rank + 1) })
     }
   })
-  return Arr.sortBy(
-    Order.flip(Order.mapInput(Order.Number, (row: { weight: number }) => row.weight)),
-    Order.flip(Order.mapInput(Order.Number, (row: { matches: number }) => row.matches)),
-    Order.flip(Order.mapInput(Order.Number, (row: { hit: Hit }) => row.hit.salience ?? 0)),
-  )([...tally.values()]).slice(0, k).map((row) => row.hit)
+  return Arr.sort([...tally.values()], Order.flip(Order.mapInput(Order.Number, (row: { weight: number }) => row.weight))).slice(0, k).map((row) => row.hit)
 })
 
 // Helix EXAMPLES §10, bounded: what each hit is about, and the other chunks reached through the same entities.
@@ -205,61 +255,86 @@ export const search = Effect.fn("search")(function*(
   const { query, filters, top, page } = options
   if (!query) return yield* new SearchError({ message: "usage: exo search <query> [filters] [--mode graph|hybrid|vector|text] ..." })
   const started = yield* Clock.currentTimeMillis
-  const bookmarksOnly = filters.kinds.length > 0 && filters.kinds.every((kind) => kind === "x_bookmark")
-  // A bare name holds no context for an embedding: measured 2026-10-12, a nonsense query sat at cosine distance 0.30,
-  // real passages naming the person at 0.30-0.33 and unrelated posts at 0.32, so no distance floor separates
-  // them. Lookups of up to three words therefore go by entity graph + BM25 only; the vector channel is for questions.
-  const lookup = query.trim().split(/\s+/).length <= 3
-  const mode = Option.getOrElse(options.mode, (): SearchMode => bookmarksOnly || lookup ? "graph" : "hybrid")
+  const mode = Option.getOrElse(options.mode, (): SearchMode => "hybrid")
   // deep enough that the asked-for page is ranked, not padded
-  const k = Option.getOrElse(options.k, () => Math.max(24, page * top * 3))
+  const k = Option.getOrElse(options.k, () => Math.max(60, page * top * 3))
 
   // Filters build the candidate stream first; vector/BM25 then rank only those candidates (Helix prefiltering).
   const stream = yield* chunkStream(filters)
   const { post } = yield* chunkFilters(filters)
-  const vectorChannel = Effect.fnUntraced(function*() {
+  const vectorChannel = Effect.gen(function*() {
     const vector = (yield* models.embed([query]))[0]!
-    const ranked = Option.match(stream, {
+    return Option.match(stream, {
       onSome: (candidates) => candidates.vectorSearch("Chunk", "embedding", [...vector], k, TENANT),
       onNone: () => g().vectorSearchNodes("Chunk", "embedding", [...vector], k, TENANT).where(post),
-    })
-    return ["~", ranked.project(withDistance)] as const
+    }).project(withDistance)
   })
+  const textChannel = (text: string) => Effect.succeed(Option.match(stream, {
+    onSome: (candidates) => candidates.textSearch("Chunk", "content", text, k, TENANT),
+    onNone: () => g().textSearchNodes("Chunk", "content", text, k, TENANT).where(post),
+  }).project(hitFields))
+  const inflected = keywordQuery(query)
   const channels = [
-    ...(mode === "vector" || mode === "hybrid" ? [yield* vectorChannel()] : []),
-    ...(mode !== "vector"
-      ? [["=", Option.match(stream, {
-        onSome: (candidates) => candidates.textSearch("Chunk", "content", query.slice(0, 200), k, TENANT),
-        onNone: () => g().textSearchNodes("Chunk", "content", query.slice(0, 200), k, TENANT).where(post),
-      }).project(hitFields)] as const]
-      : []),
+    ...(mode === "vector" || mode === "hybrid" ? [["~", vectorChannel] as const] : []),
+    ...(mode !== "vector" ? [["=", textChannel(query.slice(0, 200))] as const] : []),
+    // a second keyword list with every word's inflections: finds "transcribes" for "transcribing" without reordering the first
+    ...(mode !== "vector" && inflected !== query.toLowerCase().trim() ? [["≈", textChannel(inflected)] as const] : []),
   ]
-  const hitsOf = (channel: string, traversal: Traversal<"terminal">) =>
-    helix.read(`search_${channel}`, readBatch().varAs("hits", traversal).returning(["hits"]), Hits).pipe(Effect.map((data) => data.hits ?? []))
-  // Independent reads: a slow channel must not cost the other its results.
-  const [graphList, keywordLists] = yield* Effect.all([
+  // A failed channel (no OPENAI_API_KEY, a slow read) costs only its own list.
+  const hitsOf = (channel: string, traversal: Effect.Effect<Traversal<"terminal">, AiError.AiError, never>) =>
+    traversal.pipe(
+      Effect.flatMap((ranked) => helix.read(`search_${channel}`, readBatch().varAs("hits", ranked).returning(["hits"]), Hits)),
+      Effect.map((data) => data.hits ?? []),
+      Effect.catch((error) => Effect.as(Console.error(`(${channel} channel skipped: ${error.message.slice(0, 120)})`), [])),
+    )
+  // Titles say what a document is about ("Georgiy <> Konan: 1-1"); each matching document is represented by its
+  // first passage that passes the filters.
+  const titleChannel = (text: string) => Effect.gen(function*() {
+    const DocIds = Schema.Struct({ d: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: DocumentId }))) })
+    const ranked = yield* helix.read("search_titles", readBatch().varAs("d", g().textSearchNodes("SourceDocument", "title", text, k, TENANT).project(fields("documentId"))).returning(["d"]), DocIds)
+    const ids = Arr.dedupe((ranked.d ?? []).map((row) => row.documentId))
+    if (!ids.length) return []
+    const { anchor } = yield* chunkFilters(filters)
+    // An entity filter is a walk, not an index lookup: take the passages from its candidate stream.
+    const passages = filters.entities.length && Option.isSome(stream)
+      ? stream.value.where(Predicate.isIn("documentId", ids))
+      : g().nWithLabelWhere("Chunk", Predicate.and([Predicate.isIn("documentId", ids), ...anchor])).where(Predicate.and([post, Predicate.lte("chunkIndex", 2)]))
+    const opening = yield* helix.read(
+      "search_title_passages",
+      readBatch().varAs("c", passages.project(hitFields)).returning(["c"]),
+      Schema.Struct({ c: Schema.NullOr(Schema.Array(Hit)) }),
+    )
+    const first = new Map<string, Hit>()
+    for (const hit of Arr.sort(opening.c ?? [], Order.mapInput(Order.Number, (row: Hit) => row.chunkIndex))) if (!first.has(hit.documentId)) first.set(hit.documentId, hit)
+    return Arr.getSomes(ids.map((id) => Option.fromNullishOr(first.get(id))))
+  }).pipe(Effect.catch((error) => Effect.as(Console.error(`(T channel skipped: ${error.message.slice(0, 120)})`), [] as ReadonlyArray<Hit>)))
+  const titleQueries = mode === "vector" ? [] : [
+    ["T", query.slice(0, 200)] as const,
+    ...(inflected !== query.toLowerCase().trim() ? [["t", inflected] as const] : []),
+  ]
+  const [graphList, keywordLists, titleList] = yield* Effect.all([
     mode === "graph" || mode === "hybrid"
       ? Effect.map(graphSearch(query, filters, k), (hits) => [["G", hits] as const])
       : Effect.succeed([]),
-    Effect.forEach(channels, ([channel, traversal]) =>
-      hitsOf(channel, traversal).pipe(
-        Effect.catch((error) => Effect.as(Console.error(`(${channel} channel failed: ${error.message.slice(0, 80)})`), [])),
-        Effect.map((hits) => [channel, hits] as const),
-      ), { concurrency: "unbounded" }),
+    Effect.forEach(channels, ([channel, traversal]) => Effect.map(hitsOf(channel, traversal), (hits) => [channel, hits] as const), { concurrency: "unbounded" }),
+    Effect.forEach(titleQueries, ([channel, text]) => Effect.map(titleChannel(text), (hits) => [channel, hits] as const), { concurrency: "unbounded" }),
   ], { concurrency: "unbounded" })
-  const lists: Array<readonly [string, ReadonlyArray<Hit>]> = [...graphList, ...keywordLists]
-  // no name and no wording matched: meaning is all that is left
-  if (Option.isNone(options.mode) && mode === "graph" && !bookmarksOnly && lists.every(([, list]) => !list.length)) {
-    const [channel, traversal] = yield* vectorChannel()
-    lists.push([channel, yield* hitsOf(channel, traversal)])
-  }
+  const lists: Array<readonly [string, ReadonlyArray<Hit>]> = [...graphList, ...keywordLists, ...titleList]
 
-  // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them.
-  const fused = new Map<number, { hit: Hit; score: number; via: Array<string> }>()
+  // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them. Results
+  // are per document unless --chunks, so fusion is too: a document's best rank in each list counts, and the passage
+  // shown is the one with the best single rank.
+  const keyOf = (hit: Hit) => options.chunks ? String(hit.id) : hit.documentId
+  const fused = new Map<string, { hit: Hit; best: number; score: number; via: Array<string> }>()
   for (const [channel, list] of lists) {
+    const seen = new Set<string>()
     list.forEach((hit, rank) => {
-      const entry = fused.get(hit.id) ?? { hit, score: 0, via: [] }
-      fused.set(hit.id, { hit: entry.hit, score: entry.score + 1 / (60 + rank + 1), via: [...entry.via, channel] })
+      const key = keyOf(hit)
+      if (seen.has(key)) return
+      seen.add(key)
+      const contribution = 1 / (60 + rank + 1)
+      const entry = fused.get(key) ?? { hit, best: 0, score: 0, via: [] }
+      fused.set(key, { hit: contribution > entry.best ? hit : entry.hit, best: Math.max(entry.best, contribution), score: entry.score + contribution, via: [...entry.via, channel] })
     })
   }
   const byScore = Order.flip(Order.mapInput(Order.Number, (entry: Ranked) => entry.score))
@@ -280,7 +355,6 @@ export const search = Effect.fn("search")(function*(
       }), { concurrency: "unbounded" })
     ranked = [...Arr.sort(judged, byScore), ...ranked.slice(pool.length)]
   }
-  if (!options.chunks) ranked = Arr.dedupeWith(ranked, (a, b) => a.hit.documentId === b.hit.documentId)
   const more = ranked.length > page * top
   const paged = ranked.slice((page - 1) * top, page * top)
   const contents = options.expand && paged.length ? yield* neighbours(paged.map((entry) => entry.hit), options.expand) : paged.map((entry) => entry.hit)

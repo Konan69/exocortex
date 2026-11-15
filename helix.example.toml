@@ -6,7 +6,7 @@ container_runtime = "docker"
 [local.dev]
 port = 6972
 image = "ghcr.io/helixdb/helixdb"
-tag = "v0.0.5"
+tag = "v0.0.16"
 storage = "disk"
 
 [enterprise]

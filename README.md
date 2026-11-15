@@ -18,7 +18,7 @@ Bun 1.3, Docker, and the [Helix CLI](https://github.com/HelixDB/helix-db) (`heli
 ```bash
 git clone https://github.com/Konan69/exocortex && cd exocortex
 bun install --frozen-lockfile
-cp .env.example .env              # owner, tenant, OPENAI_API_KEY, OPENROUTER_API_KEY
+cp .env.example .env              # owner, tenant; OPENAI_API_KEY (query vectors) and OPENROUTER_API_KEY (Jev, GLM) are read only by the commands that call a model
 cp helix.example.toml helix.toml  # the local Helix project; exo runs `helix start dev` when Helix is down
 bun exo.ts taxonomy --seed --yes  # GLM drafts the categories once; ingest files passages under them
 bun exo.ts ingest fixtures/notes  # chunk, embed, link, name, settle
@@ -40,11 +40,12 @@ bun exo.ts --help                                     # every command; `bun exo.
 | Ask | Command |
 |---|---|
 | Find passages | `search "<q>" [filters] [--mode graph\|hybrid\|vector\|text] [--top N] [--page N] [--chunks] [--expand N] [--rerank] [--json]` |
+| Walk the graph | `walk "<entity>" [--hops N] [--to "<entity>"] [--top N] [--docs N] [--json]`: neighbours by `ASSOCIATED_WITH`, hops out, the documents it runs through, the fewest-hop path to another entity |
+| Any query | `schema` (labels, edges, indexes, counts), then `query --cypher '<stmt>'` (`$tenant` bound), `query --ts 'readBatch()…'` (the project's SDK, `TENANT` bound) or `query --file q.json`; writes need `--write` |
 | Browse | `docs`, `show <documentId>`, `entities`, `categories`, `stats`, `profile`, `taxonomy` (`--seed` drafts it) |
 | Add documents | `ingest <dir>` (JSON source files), `bookmarks` (X bookmarks), `bookmarks --graph` (link the ones with articles) |
 | Repair linking | `link`, `name` (stages 1 and 2 over chunks that missed them) |
 | Keep it honest | `backup`, `check`, `prune`, `dedupe`, `forget <file>`, `entities --resolve`, `entities --index-names`, `model` |
-| Debug | `helix query dev --file q.json` (Helix CLI, from this directory) |
 
 Filters (repeat a flag for OR, different flags AND): `--kind`, `--source`, `--doc`, `--category`, `--mine` (about
 the owner), `--min-salience 0.6`, `--where 'field=v'` (`!=`, `~` contains, `^` prefix), `--with-boilerplate`, `--entity
@@ -87,11 +88,13 @@ Effect 4 throughout. `exo.ts` builds the layers and runs the CLI.
 | `src/bookmarks.ts` | the X bookmark import and graph pass |
 | `src/search.ts` | hybrid graph search |
 | `src/browse.ts` | read-only views |
+| `src/walk.ts` | `walk`, `query`, `schema`: entity neighbourhoods, paths, raw Cypher / SDK / JSON queries |
 | `src/maintain.ts` | backup, check, prune, dedupe, forget, entity resolution, the profile model |
 | `src/cli.ts` | commands and flags |
 
 Configuration is `.env` (see `.env.example`).
-`bun scripts/smoke.ts` proves the Helix, Jev, GLM and embedding seams live. `scripts/eval.ts` grades search.
+`bun scripts/smoke.ts` proves the Helix, Jev, GLM and embedding seams live. `scripts/rank-eval.ts` scores search against
+the gold set; `scripts/eval.ts` asks Jev whether the graph's connected passages earn their place.
 
 ## Ingest: a document enters the graph already clean
 
@@ -116,13 +119,27 @@ entities. 105 articles cost ~$0.03 and 4 minutes.
 
 ## Search
 
-Lookups of three words or fewer, and bookmark-only searches, go by **entity graph + BM25**: BM25 over `EntityName`
-ranks up to 8 entities, the graph walks to the passages that mention them (directly or through a document-wide link),
-and that list fuses with Chunk BM25 by reciprocal rank. A bare name gives an embedding nothing (2026-10-12: a nonsense
-query sat at cosine distance 0.30, real passages naming the person at 0.30-0.33, unrelated tweets at 0.32, so no distance
-floor separates them). Longer queries add vector search. Jev rerank is off unless `--rerank` (one model call per
-candidate; paging through results is cheaper). Each hit is printed with what
-it is about, the passages connected through shared entities, and the passages Jev linked to it.
+Every query runs every list, and reciprocal-rank fusion (k = 60) joins them per document (per passage with
+`--chunks`); each list counts a document's best rank once. Each list ranks 60 candidates.
+
+| List | What it ranks |
+|---|---|
+| `G` graph | entities the query names: a phrase of the query that is exactly an entity's name, or a name holding every word of the query ("georgiy" finds Georgiy Sekretaryuk). Their passages, ranked by BM25 on the query within them |
+| `~` vector | passages nearest the query embedding (needs `OPENAI_API_KEY`; skipped with a note without it) |
+| `=` / `≈` keyword | BM25 over passages: the query as typed, and the query with every word's inflections (Helix BM25 does not stem, so "transcribing" never meets "transcribes") |
+| `T` / `t` title | BM25 over document titles, plain and inflected; a title says what a document is about ("Georgiy <> Konan: 1-1", a bookmark's post text) |
+
+`--mode graph|text|vector` leaves lists out to compare. Jev rerank is off unless `--rerank` (one model call per
+candidate). Each hit is printed with what it is about, the passages connected through shared entities, and the passages
+Jev linked to it.
+
+**Measured** with `bun scripts/rank-eval.ts <label>` against `fixtures/eval/gold.jsonl` (40 queries: names, topics,
+questions, half-remembered posts; 1,121 graded documents), run through the CLI. 2026-11-15, vector list off:
+nDCG@10 0.547 → 0.734, recall@10 0.443 → 0.567, MRR 0.740 → 0.938. What moved it: entities only when the query names
+them (0.583), BM25 within an entity's passages (0.597), the inflected keyword list (0.610), the title lists (0.686,
+0.696), 60 candidates per list (0.734). Tried and reverted: prefiltering boilerplate (no change, 3x slower), inflections
+folded into one query (0.562), RRF k = 20 (a peak beside a cliff at k = 10), summing every passage of a document (0.642),
+one keyword vote (0.665).
 
 ## Rules that came out of measuring (do not undo without re-measuring)
 
@@ -160,8 +177,8 @@ Eval runs are in `eval.history.jsonl` (`bun scripts/eval.ts "<note>"`).
 - **Hubs are not walked.** An entity held by more than 60 passages says nothing about any one of them. Expansion skips
   them and weights a shared entity by `1 / log2(1 + passages holding it)`. Hubs still work as filters.
 - **LLM output is never trusted unchecked.** GLM proposes ~3x more names than survive Jev's check.
-- **Ranking boost from the graph was tested and removed:** top-8 0.845 plain vs 0.842 boosted over 20 queries. The
-  graph filters and cross-references; it does not rank.
+- **The graph ranks only through entities the query names** (see Search). A boost from every entity a passage shares
+  with the query was tested and removed in 2026-09 (top-8 0.845 plain vs 0.842).
 
 Quality, last measured (2026-09-20, 2,595 docs, 20,509 links): search top-8 0.885, next-8 0.772, graph-reached 0.640
 (74/112 useful, 43 that plain search never reaches). Hand audit of 40 random links: 34 hold, 4 weak, 2 wrong.
@@ -172,14 +189,14 @@ Quality, last measured (2026-09-20, 2,595 docs, 20,509 links): search top-8 0.88
   `g().dropEdgeById(...)`. Node `.drop()` cascades its edges. `outN()` of an out-edge is its target, `inN()` its source.
 - ≤512 text-indexed node mutations per write; index DDL cannot share a batch with data; one writer (concurrent writes
   answer 409, so `Helix.write` serializes them); a full scan of every link is 20-90 s.
-- Storage is SlateDB on the MinIO bucket `helix-db`; text and vector indexes live there too.
+- Storage is SlateDB on the SeaweedFS bucket `helix-db` (CLI 3.7+, image v0.0.16; older MinIO volumes need the copy in Helix's "Migrate MinIO disk data" guide). Text and vector indexes live there too.
 
 ## Open
 
-- **Helix v0.0.5 cannot build a text index over a populated label** (`Entity.name`, 2026-09-28: loops at
-  `validate_manifests` past 8,000 attempts and blocks the index queue). The `EntityName` shadow label carries the BM25
-  index instead, created while empty and maintained in the same write as every Entity change. Never call
-  `createIndexIfNotExists` for `Entity.name`. Keep the shadow until Helix fixes the build.
+- **Helix v0.0.5 could not build a text index over a populated label** (`Entity.name`, 2026-09-28: looped at
+  `validate_manifests` past 8,000 attempts). The `EntityName` shadow label carries the BM25 index instead. On v0.0.16
+  the `SourceDocument.title` index built over 4,040 existing documents in ~3 s (2026-11-15), so the shadow can likely
+  go; not tried for `Entity.name` yet.
 - **2,650+ entities are held by exactly one passage.** Mostly real and specific, with a junk tail. They can never be
   walked or join two passages; their only job is to be a label you can filter by. Cutting them cuts true information,
   so it is the owner's call.

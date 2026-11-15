@@ -11,11 +11,11 @@
     "smoke": "bun scripts/smoke.ts"
   },
   "dependencies": {
-    "effect": "4.1.2",
     "@effect/ai-openai": "4.1.2",
     "@effect/ai-openrouter": "4.1.2",
     "@effect/platform-bun": "4.1.2",
-    "@helix-db/helix-db": "3.1.0"
+    "@helix-db/helix-db": "3.2.0",
+    "effect": "4.1.2"
   },
   "devDependencies": {
     "@types/bun": "latest",

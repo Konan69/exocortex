@@ -22,6 +22,7 @@ const INDEXES: ReadonlyArray<readonly [string, IndexSpec]> = [
   ["doc_status", IndexSpec.nodeEquality("SourceDocument", "status")],
   ["doc_kind", IndexSpec.nodeEquality("SourceDocument", "kind")],
   ["doc_source", IndexSpec.nodeEquality("SourceDocument", "source")],
+  ["doc_title_txt", IndexSpec.nodeText("SourceDocument", "title", "tenant_id")],
   ["chunk_doc", IndexSpec.nodeEquality("Chunk", "documentId")],
   ["chunk_id", IndexSpec.nodeEquality("Chunk", "chunkId")],
   ["chunk_kind", IndexSpec.nodeEquality("Chunk", "documentKind")],
@@ -58,6 +59,8 @@ export class Helix extends Context.Service<Helix, {
     batch: WriteBatch,
     schema: S,
   ) => Effect.Effect<S["Type"], HelixError, S["DecodingServices"]>
+  /** Posts a body as given to a Helix endpoint and returns the response text: `exo query`, for agents. */
+  readonly raw: (path: "/v2/query" | "/v2/cypher" | "/v2/cypher/explain", body: string, options?: { readonly write?: boolean }) => Effect.Effect<string, HelixError>
   /** Creates every index exo relies on and waits until all are active. Run before the first write of a command. */
   readonly ensureIndexes: Effect.Effect<void, HelixError>
 }>()("exo/Helix") {
@@ -66,14 +69,13 @@ export class Helix extends Context.Service<Helix, {
     const http = yield* HttpClient.HttpClient
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const writer = yield* Semaphore.make(1)
-    const url = `${settings.helixUrl}/v2/query`
 
     const reachable = http.get(settings.helixUrl).pipe(
       Effect.timeout("1 second"),
       Effect.as(true),
       Effect.catch(() => Effect.succeed(false)),
     )
-    // The local instance is the `dev` instance of the Helix CLI project in helix.toml (disk storage on MinIO). Its
+    // The local instance is the `dev` instance of the Helix CLI project in helix.toml (disk storage on SeaweedFS). Its
     // containers have restart policy `no`, so they are off after a WSL boot; `helix start` brings them back on the
     // same volume. The CLI can report "not ready" while the server is fine, so readiness is judged by asking Helix.
     const start = Effect.gen(function*() {
@@ -90,11 +92,11 @@ export class Helix extends Context.Service<Helix, {
     })
     const ensureUp = yield* Effect.cached(start)
 
-    const post = (query: string, body: string, headers: Record<string, string>) =>
+    const post = (query: string, body: string, headers: Record<string, string>, path = "/v2/query") =>
       Effect.gen(function*() {
         yield* ensureUp
         const response = yield* http.execute(
-          HttpClientRequest.post(url).pipe(
+          HttpClientRequest.post(`${settings.helixUrl}${path}`).pipe(
             HttpClientRequest.setHeaders({ "content-type": "application/json", ...headers }),
             HttpClientRequest.bodyText(body, "application/json"),
           ),
@@ -138,10 +140,14 @@ export class Helix extends Context.Service<Helix, {
       }
     })
 
+    const raw = (path: "/v2/query" | "/v2/cypher" | "/v2/cypher/explain", body: string, options?: { readonly write?: boolean }) =>
+      options?.write ? writer.withPermits(1)(post(`raw ${path}`, body, { "x-helix-await-durable": "true" }, path)) : post(`raw ${path}`, body, {}, path)
+
     return Helix.of({
       read,
       write,
       writeReturning,
+      raw,
       ensureIndexes: yield* Effect.cached(ensureIndexes),
     })
   }))
