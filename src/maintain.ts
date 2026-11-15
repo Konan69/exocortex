@@ -3,7 +3,7 @@
 // chunk's judged properties). prune, dedupe, resolve and model work from the newest one, so nothing is deleted that is
 // not already on disk. Node and edge ids are stable, so a backup is also the work list.
 import { createHash } from "node:crypto"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { BatchCondition, EdgeRef, Expr, g, NodeRef, Predicate, readBatch, SourcePredicate, type Traversal, writeBatch } from "@helix-db/helix-db"
 import { Array as Arr, Clock, Console, Effect, FileSystem, Option, Order, Result, Schema } from "effect"
 import { Decision } from "effect/ai"
@@ -165,6 +165,7 @@ export const backup = Effect.fn("backup")(function*(dir: Option.Option<string>) 
   yield* fs.writeFileString(mentionsFile, "")
   yield* fs.writeFileString(categoriesFile, "")
   let mentions = 0
+  let categories = 0
   for (const page of Arr.chunksOf([...new Set(chunks.map((chunk) => chunk.documentId))], 60)) {
     const batch = page.reduce((out, documentId, index) => out
       .varAs(`m${index}`, chunksOfDocument(documentId).outE("MENTIONS").valueMap(["$id", "$from", "$to", "confidence", "by", "entityKey"]))
@@ -176,8 +177,19 @@ export const backup = Effect.fn("backup")(function*(dir: Option.Option<string>) 
     yield* fs.writeFileString(mentionsFile, toLines(linkRows), { flag: "a" })
     yield* fs.writeFileString(categoriesFile, toLines(categoryRows), { flag: "a" })
     mentions += linkRows.length
+    categories += categoryRows.length
   }
-  yield* Console.log(`${FILES.chunkMentions.padEnd(26)} ${mentions}\n→ ${target}`)
+  // Read right after a large write, the per-document pages have come back short (2026-11-15: 13,597 of 21,287 links)
+  // while the graph was whole. Hygiene commands trust the newest backup, so a short one is removed, not kept.
+  const live = yield* helix.read("backup_totals", readBatch()
+    .varAs("mentions", g().nWithLabel("Chunk").where(tenantScope).outE("MENTIONS").count())
+    .varAs("categories", g().nWithLabel("Chunk").where(tenantScope).outE("IN_CATEGORY").count())
+    .returning(["mentions", "categories"]), Schema.Struct({ mentions: Schema.Finite, categories: Schema.Finite }))
+  if (live.mentions !== mentions || live.categories !== categories) {
+    yield* fs.remove(target, { recursive: true })
+    return yield* new BrokenInvariant({ message: `backup incomplete (links ${mentions} of ${live.mentions}, categories ${categories} of ${live.categories}); removed ${target}, run it again` })
+  }
+  yield* Console.log(`${FILES.chunkMentions.padEnd(26)} ${mentions}\n${FILES.chunkCategories.padEnd(26)} ${categories}\n→ ${target}`)
 })
 
 // ---------------------------------------------------------------- check
@@ -208,6 +220,8 @@ export const check = Effect.gen(function*() {
   const unjudged = chunks - judged - exempt
   yield* line("  not judged by Jev (article bookmarks included)", unjudged, unjudged === 0)
   yield* line("  index-only bookmark exemptions", exempt)
+  const queue = yield* resolutionQueue()
+  yield* line(`  entity pairs waiting for \`entities --resolve\``, `${queue.due.length} (backup ${basename(queue.dir)})`, queue.due.length === 0)
   yield* line("  flagged, waiting for naming", yield* count("unnamed", g().nWithLabelWhere("Chunk", Predicate.eq("needsNaming", true)).where(tenantScope).count()))
   const links = yield* count("links", mentions().count())
   yield* line("links chunk→entity", links)
@@ -465,19 +479,25 @@ const SameThing = Decision.make({
  * reading a passage for each side, one pair a request (packed pairs leak into each other). A confirmed group is merged
  * into its best-held name: links re-pointed, other names kept in `aliases`, emptied nodes dropped.
  */
-export const resolveEntities = Effect.fn("resolveEntities")(function*(options: { readonly yes: boolean; readonly limit: Option.Option<number> }) {
-  const helix = yield* Helix
-  const models = yield* Models
-  const fs = yield* FileSystem.FileSystem
+/** The pairs the graph proposes as one thing under two names, and which of them Jev has not judged yet. */
+const resolutionQueue = Effect.fnUntraced(function*() {
   const dir = yield* latestBackup
-  const log = join(dir, "resolve.jsonl")
+  // one verdict log for every backup: entity ids outlive a backup, and a pair judged once is not asked again
+  const log = join(dir, "..", "resolve.jsonl")
   const entities = new Map((yield* fromBackup.entities(dir)).map((entity) => [entity.$id, entity]))
   const entity = (id: NodeId) => entities.get(id)!
   const slugOf = (id: NodeId) => entity(id).entityKey.split(":")[2] ?? ""
   const squashOf = (id: NodeId) => `${entity(id).kind}|${normalise(entity(id).name).replace(/-/g, "")}`
+  const namePartsOf = (id: NodeId) => normalise(entity(id).name).split("-").filter(Boolean)
+  const isPartOf = (short: NodeId, long: NodeId) => {
+    const words = namePartsOf(short), whole = new Set(namePartsOf(long))
+    return entity(short).kind === "person" && entity(long).kind === "person" && words.length < whole.size && words.every((word) => whole.has(word))
+  }
   const links = standingLinks(yield* fromBackup.chunkMentions(dir)).filter((edge) => entities.has(edge.$to))
   const holders = new Map<NodeId, Set<NodeId>>()
   for (const edge of links) holders.set(edge.$to, (holders.get(edge.$to) ?? new Set()).add(edge.$from))
+  const personsWith = new Map<string, Array<NodeId>>()
+  for (const id of holders.keys()) if (entity(id).kind === "person") for (const word of new Set(namePartsOf(id))) personsWith.set(word, [...(personsWith.get(word) ?? []), id])
   const byChunk = Arr.groupBy(links, (edge) => String(edge.$from))
   const together = new Map<string, { a: NodeId; b: NodeId; count: number; chunk: NodeId }>()
   for (const edges of Object.values(byChunk)) {
@@ -506,10 +526,30 @@ export const resolveEntities = Effect.fn("resolveEntities")(function*(options: {
       candidates.push({ a, b, count: 0, chunk: [...holders.get(a)!][0]!, chunkB: [...holders.get(b)!][0]! })
     }
   }
+  // A person is often named by one part of their name ("Georgiy" for Georgiy Sekretaryuk), and like an alias the two
+  // never share a passage. Each person whose name is every word of another person's name is proposed with that one.
+  for (const short of [...holders.keys()].filter((id) => entity(id).kind === "person")) {
+    const words = namePartsOf(short)
+    for (const long of personsWith.get(words[0]!) ?? []) {
+      if (long === short || !isPartOf(short, long)) continue
+      const a = Math.min(short, long), b = Math.max(short, long)
+      if (seen.has(`${a}>${b}`)) continue
+      seen.add(`${a}>${b}`)
+      candidates.push({ a, b, count: 0, chunk: [...holders.get(a)!][0]!, chunkB: [...holders.get(b)!][0]! })
+    }
+  }
   const done = new Set((yield* readJsonl(log, Pairing)).map((row) => `${row.a}>${row.b}`))
   const due = candidates.filter(({ a, b }) => !done.has(`${a}>${b}`))
+  return { dir, log, entities, entity, slugOf, squashOf, isPartOf, links, holders, candidates, done, due }
+})
+
+export const resolveEntities = Effect.fn("resolveEntities")(function*(options: { readonly yes: boolean; readonly limit: Option.Option<number> }) {
+  const helix = yield* Helix
+  const models = yield* Models
+  const fs = yield* FileSystem.FileSystem
+  const { dir, log, entities, entity, slugOf, squashOf, isPartOf, links, holders, candidates, done, due } = yield* resolutionQueue()
   const pending = Option.match(options.limit, { onNone: () => due, onSome: (limit) => due.slice(0, limit) })
-  yield* Console.log(`${dir}\n${candidates.length} candidate pairs (${candidates.filter((pair) => pair.count > 0).length} share passages, ${candidates.filter((pair) => pair.count === 0).length} spelling variants) · ${done.size} already judged · ${pending.length} to judge → ${pending.length} Jev requests (one pair each)`)
+  yield* Console.log(`${dir}\n${candidates.length} candidate pairs (${candidates.filter((pair) => pair.count > 0).length} share passages, ${candidates.filter((pair) => pair.count === 0).length} spelling variants) · ${done.size} already judged · ${due.length} waiting · ${pending.length} to judge now → ${pending.length} Jev requests (one pair each)`)
   let judged = 0
   yield* Effect.forEach(pending, (pair) =>
     Effect.gen(function*() {
@@ -530,7 +570,13 @@ export const resolveEntities = Effect.fn("resolveEntities")(function*(options: {
     .flatMap((ids) => ids.slice(1).map((id) => ({ a: ids[0], b: id, chunk: 0, same: 1 })))
   const isVariant = (row: Pairing) => squashOf(row.a) === squashOf(row.b)
   const verdicts = (yield* readJsonl(log, Pairing)).filter((row) => entities.has(row.a) && entities.has(row.b) && slugOf(row.a) !== slugOf(row.b))
-  const confirmed = [...sameName, ...verdicts.filter((row) => row.same >= (isVariant(row) ? Floors.alias : 0.9))]
+  const accepted = verdicts.filter((row) => row.same >= (isVariant(row) ? Floors.alias : 0.9))
+  // "Rafael" confirmed as both Rafael Posada and Rafael Nadal would fold two people into one: a part-name that more
+  // than one full name claims stays as it is.
+  const partOf = (row: Pairing) => isPartOf(row.a, row.b) ? row.a : isPartOf(row.b, row.a) ? row.b : undefined
+  const claims = new Map<NodeId, number>()
+  for (const row of accepted) { const short = partOf(row); if (short !== undefined) claims.set(short, (claims.get(short) ?? 0) + 1) }
+  const confirmed = [...sameName, ...accepted.filter((row) => { const short = partOf(row); return short === undefined || claims.get(short) === 1 })]
   yield* Console.log(`${sameName.length} same-name pairs (merged without asking) · ${confirmed.filter((row) => !isVariant(row)).length - sameName.length} confirmed by Jev at 0.9 · ${confirmed.filter(isVariant).length} spelling variants at ${Floors.alias}`)
   // confirmed pairs → groups (a=b, b=c ⇒ one group), each merged into its best-held member
   const parent = new Map<NodeId, NodeId>()
