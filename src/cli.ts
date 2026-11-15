@@ -33,9 +33,9 @@ const filterFlags = {
 const filtersOf = (input: { readonly [K in keyof Filters]: Filters[K] }): Filters => input
 
 const searchCommand = Command.make("search", {
-  query: Argument.String("query").pipe(Argument.withDescription("names (≤3 words) go by graph + BM25; questions add vectors"), Argument.variadic()),
+  query: Argument.String("query").pipe(Argument.withDescription("names, topics, questions or half-remembered posts"), Argument.variadic()),
   ...filterFlags,
-  mode: Flag.Literals("mode", ["graph", "hybrid", "vector", "text"]).pipe(Flag.optional),
+  mode: Flag.Literals("mode", ["graph", "hybrid", "vector", "text"]).pipe(Flag.withDescription("default hybrid: graph, vector, passage and title BM25 fused by RRF"), Flag.optional),
   k: Flag.Int("k").pipe(Flag.withDescription("candidates per channel"), Flag.optional),
   top: Flag.Int("top").pipe(Flag.withDefault(8)),
   page: Flag.Int("page").pipe(Flag.withDefault(1)),

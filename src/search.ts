@@ -12,7 +12,7 @@ export type SearchMode = "graph" | "hybrid" | "vector" | "text"
 export interface SearchOptions {
   readonly query: string
   readonly filters: Filters
-  /** default: graph for lookups of ≤3 words and bookmark-only searches, hybrid otherwise */
+  /** default hybrid: every list runs and RRF decides; the others leave lists out to compare */
   readonly mode: Option.Option<SearchMode>
   /** candidates per channel; default max(24, page × top × 3) */
   readonly k: Option.Option<number>
@@ -69,12 +69,12 @@ const Useful = Decision.make({
 // Words that never name anything on their own: a one-word name match on one of these is noise.
 const STOPWORDS = new Set("a an and are as at be by can could did do does for from had has have how i in is it me my of on or our say said should so than that the their them then there these they this to was we were what when where which who why will with without would you your about into over just like more most some such".split(" "))
 
-/** Entities named in the query: every phrase of it that is exactly an entity's name, longest first, and (for a short
- *  lookup) names that contain every word of it, so "georgiy" finds "Georgiy Sekretaryuk". */
+/** Entities named in the query: every phrase of it that is exactly an entity's name, longest first, and names that
+ *  contain every word of it, so "georgiy" finds "Georgiy Sekretaryuk". */
 const namedIn = (query: string, names: ReadonlyArray<{ readonly entityKey: EntityKey; readonly name: string }>, exact: ReadonlyArray<EntityKey>) => {
   const words = normalise(query).split("-").filter(Boolean)
   const content = words.filter((word) => !STOPWORDS.has(word))
-  const containsQuery = content.length > 0 && content.length <= 3
+  const containsQuery = content.length > 0
     ? names.filter((row) => { const own = new Set(normalise(row.name).split("-")); return content.every((word) => own.has(word)) }).map((row) => row.entityKey)
     : []
   const length = (key: EntityKey) => key.split(":").at(-1)!.split("-").length
@@ -255,12 +255,7 @@ export const search = Effect.fn("search")(function*(
   const { query, filters, top, page } = options
   if (!query) return yield* new SearchError({ message: "usage: exo search <query> [filters] [--mode graph|hybrid|vector|text] ..." })
   const started = yield* Clock.currentTimeMillis
-  const bookmarksOnly = filters.kinds.length > 0 && filters.kinds.every((kind) => kind === "x_bookmark")
-  // A bare name holds no context for an embedding: measured 2026-10-12, a nonsense query sat at cosine distance 0.30,
-  // real passages naming the person at 0.30-0.33 and unrelated posts at 0.32, so no distance floor separates
-  // them. Lookups of up to three words therefore go by entity graph + BM25 only; the vector channel is for questions.
-  const lookup = query.trim().split(/\s+/).length <= 3
-  const mode = Option.getOrElse(options.mode, (): SearchMode => bookmarksOnly || lookup ? "graph" : "hybrid")
+  const mode = Option.getOrElse(options.mode, (): SearchMode => "hybrid")
   // deep enough that the asked-for page is ranked, not padded
   const k = Option.getOrElse(options.k, () => Math.max(24, page * top * 3))
 
@@ -321,10 +316,6 @@ export const search = Effect.fn("search")(function*(
     Effect.forEach(titleQueries, ([channel, text]) => Effect.map(titleChannel(text), (hits) => [channel, hits] as const), { concurrency: "unbounded" }),
   ], { concurrency: "unbounded" })
   const lists: Array<readonly [string, ReadonlyArray<Hit>]> = [...graphList, ...keywordLists, ...titleList]
-  // no name and no wording matched: meaning is all that is left
-  if (Option.isNone(options.mode) && mode === "graph" && !bookmarksOnly && lists.every(([, list]) => !list.length)) {
-    lists.push(["~", yield* hitsOf("~", vectorChannel)])
-  }
 
   // Reciprocal-rank fusion, app-side: Helix returns separate ranked lists and prescribes RRF to join them. Results
   // are per document unless --chunks, so fusion is too: a document's best rank in each list counts, and the passage
