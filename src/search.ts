@@ -14,7 +14,7 @@ export interface SearchOptions {
   readonly filters: Filters
   /** default hybrid: every list runs and RRF decides; the others leave lists out to compare */
   readonly mode: Option.Option<SearchMode>
-  /** candidates per channel; default max(24, page × top × 3) */
+  /** candidates per channel; default max(60, page × top × 3) */
   readonly k: Option.Option<number>
   readonly top: number
   readonly page: number
@@ -257,7 +257,7 @@ export const search = Effect.fn("search")(function*(
   const started = yield* Clock.currentTimeMillis
   const mode = Option.getOrElse(options.mode, (): SearchMode => "hybrid")
   // deep enough that the asked-for page is ranked, not padded
-  const k = Option.getOrElse(options.k, () => Math.max(24, page * top * 3))
+  const k = Option.getOrElse(options.k, () => Math.max(60, page * top * 3))
 
   // Filters build the candidate stream first; vector/BM25 then rank only those candidates (Helix prefiltering).
   const stream = yield* chunkStream(filters)
