@@ -295,9 +295,13 @@ export const search = Effect.fn("search")(function*(
     const ids = Arr.dedupe((ranked.d ?? []).map((row) => row.documentId))
     if (!ids.length) return []
     const { anchor } = yield* chunkFilters(filters)
+    // An entity filter is a walk, not an index lookup: take the passages from its candidate stream.
+    const passages = filters.entities.length && Option.isSome(stream)
+      ? stream.value.where(Predicate.isIn("documentId", ids))
+      : g().nWithLabelWhere("Chunk", Predicate.and([Predicate.isIn("documentId", ids), ...anchor])).where(Predicate.and([post, Predicate.lte("chunkIndex", 2)]))
     const opening = yield* helix.read(
       "search_title_passages",
-      readBatch().varAs("c", g().nWithLabelWhere("Chunk", Predicate.and([Predicate.isIn("documentId", ids), ...anchor])).where(Predicate.and([post, Predicate.lte("chunkIndex", 2)])).project(hitFields)).returning(["c"]),
+      readBatch().varAs("c", passages.project(hitFields)).returning(["c"]),
       Schema.Struct({ c: Schema.NullOr(Schema.Array(Hit)) }),
     )
     const first = new Map<string, Hit>()

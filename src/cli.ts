@@ -53,7 +53,7 @@ const searchCommand = Command.make("search", {
 const walkCommand = Command.make("walk", {
   name: Argument.String("name").pipe(Argument.withDescription("an entity: person, organisation, product, project, place or topic"), Argument.variadic()),
   to: Flag.String("to").pipe(Flag.withDescription("print the shortest ASSOCIATED_WITH path to this entity"), Flag.optional),
-  hops: Flag.Int("hops").pipe(Flag.withDescription("how far out to walk (with --to: the most hops to search, default 4)"), Flag.withDefault(1)),
+  hops: Flag.Int("hops").pipe(Flag.withDescription("how far out to walk, default 1 (with --to: the most hops to search, default 4)"), Flag.optional),
   top: Flag.Int("top").pipe(Flag.withDescription("neighbours kept per hop"), Flag.withDefault(15)),
   docs: Flag.Int("docs").pipe(Flag.withDescription("documents listed"), Flag.withDefault(10)),
   json,

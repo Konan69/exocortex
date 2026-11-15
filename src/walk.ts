@@ -17,7 +17,8 @@ const DocHit = Schema.Struct({ documentId: Schema.String, title: Schema.String }
 
 const entityFields = [idAs(), ...fields("entityKey", "kind", "name")]
 
-/** The entity a name means: exact names in any kind and the best BM25 matches on EntityName, the most mentioned first. */
+/** The entity a name means: an exact name in any kind first, then the best BM25 matches on EntityName; within each,
+ *  the most mentioned first. The rest are printed as `also`. */
 const resolve = Effect.fnUntraced(function*(name: string) {
   const helix = yield* Helix
   const exact = ENTITY_KINDS.map((kind) => entityKeyOf(kind, name))
@@ -39,10 +40,12 @@ const resolve = Effect.fnUntraced(function*(name: string) {
     found.reduce((b, row, index) => b.varAs(`s${index}`, g().n(row.id).inE("MENTIONS").count()), readBatch()).returning(found.map((_, index) => `s${index}`)),
     Schema.Record(Schema.String, Schema.Finite),
   )
-  const ranked = Arr.sort(
-    found.map((row, index) => ({ ...row, mentions: sizes[`s${index}`] ?? 0 })),
-    Order.flip(Order.mapInput(Order.Number, (row: Entity & { mentions: number }) => row.mentions)),
-  )
+  const exactKeys = new Set<string>(exact)
+  type Candidate = Entity & { readonly mentions: number }
+  const ranked = Arr.sortBy(
+    Order.flip(Order.mapInput(Order.Boolean, (row: Candidate) => exactKeys.has(row.entityKey))),
+    Order.flip(Order.mapInput(Order.Number, (row: Candidate) => row.mentions)),
+  )(found.map((row, index) => ({ ...row, mentions: sizes[`s${index}`] ?? 0 })))
   return { entity: ranked[0]!, also: ranked.slice(1).map((row) => `${row.name} (${row.kind}, ${row.mentions})`) }
 })
 
@@ -117,7 +120,7 @@ const pathBetween = Effect.fnUntraced(function*(from: Entity, to: Entity, maxHop
 export interface WalkOptions {
   readonly name: string
   readonly to: Option.Option<string>
-  readonly hops: number
+  readonly hops: Option.Option<number>
   readonly top: number
   readonly docs: number
   readonly json: boolean
@@ -128,15 +131,15 @@ export const walk = Effect.fn("walk")(function*(options: WalkOptions): Effect.fn
   const { entity, also } = yield* resolve(options.name)
   if (Option.isSome(options.to)) {
     const target = (yield* resolve(options.to.value)).entity
-    const path = yield* pathBetween(entity, target, Math.max(1, options.hops > 1 ? options.hops : 4))
+    const path = entity.id === target.id ? [entity.name] : yield* pathBetween(entity, target, Math.max(1, Option.getOrElse(options.hops, () => 4)))
     if (options.json) return yield* Console.log(JSON.stringify({ from: entity, to: target, path }, null, 2))
-    return yield* Console.log(path ? `${path.join("  →  ")}   (${path.length - 1} hop${path.length > 2 ? "s" : ""})` : `no path between ${entity.name} and ${target.name}`)
+    return yield* Console.log(path ? `${path.join("  →  ")}   (${path.length - 1} hop${path.length === 2 ? "" : "s"})` : `no path between ${entity.name} and ${target.name}`)
   }
 
   const layers: Array<ReadonlyArray<Neighbour & { readonly via: string }>> = []
   const visited = new Set([entity.id])
   let frontier: ReadonlyArray<{ id: number; name: string }> = [entity]
-  for (let hop = 0; hop < Math.max(1, options.hops); hop++) {
+  for (let hop = 0; hop < Math.max(1, Option.getOrElse(options.hops, () => 1)); hop++) {
     const around = yield* neighbourhoods(frontier.map((row) => row.id))
     const layer = frontier.flatMap((from) => (around.get(from.id) ?? []).map((row) => ({ ...row, via: from.name })))
       .filter((row) => !visited.has(row.id))
@@ -197,8 +200,6 @@ export const schema = Effect.gen(function*() {
   for (const name of [...labels, ...edges]) yield* Console.log(`  ${name.padEnd(16)} ${counts[name] ?? 0}`)
 })
 
-const WRITE_CYPHER = /\b(CREATE|MERGE|SET|DELETE|DETACH|REMOVE)\b/i
-
 export interface QueryOptions {
   readonly cypher: Option.Option<string>
   readonly ts: Option.Option<string>
@@ -215,21 +216,26 @@ export const query = Effect.fn("query")(function*(options: QueryOptions): Effect
   if (given.length !== 1) return yield* new WalkError({ message: "exo query: pass exactly one of --cypher, --ts, --file" })
   if (Option.isSome(options.cypher)) {
     const statement = options.cypher.value
-    if (WRITE_CYPHER.test(statement) && !options.write && !options.explain) return yield* new WalkError({ message: "that statement writes; add --write" })
     const parameters: Record<string, string> = { tenant: TENANT }
     for (const pair of options.params) {
       const at = pair.indexOf("=")
       if (at < 1) return yield* new WalkError({ message: `bad --param "${pair}" (use name=value)` })
       parameters[pair.slice(0, at)] = pair.slice(at + 1)
     }
-    const text = yield* helix.raw(options.explain ? "/v2/cypher/explain" : "/v2/cypher", JSON.stringify({ query: statement, parameters }), { write: options.write })
-    return yield* Console.log(text)
+    const body = JSON.stringify({ query: statement, parameters })
+    const plan = yield* helix.raw("/v2/cypher/explain", body)
+    if (options.explain) return yield* Console.log(plan)
+    // Helix's planner says whether the statement writes; a keyword match would refuse `RETURN "CREATE"`.
+    const effect = yield* Effect.try({ try: () => (JSON.parse(plan) as { effect?: unknown }).effect, catch: (cause) => new WalkError({ message: `explain: ${String(cause)}` }) })
+    if (effect !== "Read" && !options.write) return yield* new WalkError({ message: "that statement writes; add --write" })
+    return yield* Console.log(yield* helix.raw("/v2/cypher", body, { write: effect !== "Read" }))
   }
   if (Option.isSome(options.file)) {
     const path = options.file.value
     const body = yield* Effect.tryPromise({ try: () => Bun.file(path).text(), catch: (cause) => new WalkError({ message: String(cause) }) })
-    if (body.includes('"request_type":"write"') && !options.write) return yield* new WalkError({ message: "that request writes; add --write" })
-    return yield* Console.log(yield* helix.raw("/v2/query", body, { write: options.write }))
+    const requestType = yield* Effect.try({ try: () => (JSON.parse(body) as { request_type?: unknown }).request_type, catch: (cause) => new WalkError({ message: `${path}: ${String(cause)}` }) })
+    if (requestType !== "read" && !options.write) return yield* new WalkError({ message: "that request writes; add --write" })
+    return yield* Console.log(yield* helix.raw("/v2/query", body, { write: requestType !== "read" }))
   }
   const expression = Option.getOrThrow(options.ts)
   const built = yield* Effect.try({
