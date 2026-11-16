@@ -167,6 +167,11 @@ Eval runs are in `eval.history.jsonl` (`bun scripts/eval.ts "<note>"`).
   URL), written differently by two ingests of the same video: 51 of 53 near-copies differed only there. A second test
   on running text (8-word shingles, ≥80% contained, equal-standing pairs must agree on title) catches the same text cut
   differently: 197 documents.
+- **Resolution runs on its own.** `bookmarks-refresh` ends with `backup`, `entities --resolve --yes`, `backup`, and
+  `exo check` fails while proposed pairs wait for Jev. Verdicts live in one `backup/resolve.jsonl` across backups, so a
+  pair is judged once. A person named by part of their name ("Georgiy" for Georgiy Sekretaryuk) is proposed with that
+  person; a part-name two full names claim is left alone. `exo backup` compares its rows with live counts and removes
+  itself when short (a backup taken right after a large merge once came back with 13,597 of 21,287 links).
 - **Same name = same node.** Identical normalised names merge without asking; Jev decides aliases ("RAG" =
   "retrieval-augmented generation"). Aliases are the pairs that never co-occur (a writer picks one spelling per
   passage), so they are proposed by squashing spacing and punctuation and accepted at 0.8: of 33 such pairs only 9
