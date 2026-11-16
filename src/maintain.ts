@@ -221,8 +221,11 @@ export const check = Effect.gen(function*() {
   const unjudged = chunks - judged - exempt
   yield* line("  not judged by Jev (article bookmarks included)", unjudged, unjudged === 0)
   yield* line("  index-only bookmark exemptions", exempt)
-  const queue = yield* resolutionQueue()
-  yield* line(`  entity pairs waiting for \`entities --resolve\``, `${queue.due.length} (backup ${basename(queue.dir)})`, queue.due.length === 0)
+  const waiting = yield* resolutionQueue().pipe(
+    Effect.map((queue) => ({ value: `${queue.due.length} (backup ${basename(queue.dir)})`, ok: queue.due.length === 0 })),
+    Effect.catchTag("NoBackup", () => Effect.succeed({ value: "no backup yet", ok: true })),
+  )
+  yield* line(`  entity pairs waiting for \`entities --resolve\``, waiting.value, waiting.ok)
   yield* line("  flagged, waiting for naming", yield* count("unnamed", g().nWithLabelWhere("Chunk", Predicate.eq("needsNaming", true)).where(tenantScope).count()))
   const links = yield* count("links", mentions().count())
   yield* line("links chunk→entity", links)
@@ -572,12 +575,25 @@ export const resolveEntities = Effect.fn("resolveEntities")(function*(options: {
   const isVariant = (row: Pairing) => squashOf(row.a) === squashOf(row.b)
   const verdicts = (yield* readJsonl(log, Pairing)).filter((row) => entities.has(row.a) && entities.has(row.b) && slugOf(row.a) !== slugOf(row.b))
   const accepted = verdicts.filter((row) => row.same >= (isVariant(row) ? Floors.alias : 0.9))
-  // "Rafael" confirmed as both Rafael Posada and Rafael Nadal would fold two people into one: a part-name that more
-  // than one full name claims stays as it is.
+  // "Rafael" confirmed as both Rafael Posada and Rafael Nadal would fold two people into one: a part-name whose group
+  // (the part-name with its other spellings) more than one full-name group claims stays as it is.
   const partOf = (row: Pairing) => isPartOf(row.a, row.b) ? row.a : isPartOf(row.b, row.a) ? row.b : undefined
-  const claims = new Map<NodeId, number>()
-  for (const row of accepted) { const short = partOf(row); if (short !== undefined) claims.set(short, (claims.get(short) ?? 0) + 1) }
-  const confirmed = [...sameName, ...accepted.filter((row) => { const short = partOf(row); return short === undefined || claims.get(short) === 1 })]
+  const settled = [...sameName, ...accepted.filter((row) => partOf(row) === undefined)]
+  const group = new Map<NodeId, NodeId>()
+  const groupOf = (id: NodeId): NodeId => {
+    let root = id
+    while (group.has(root) && group.get(root) !== root) root = group.get(root)!
+    return root
+  }
+  for (const { a, b } of settled) group.set(groupOf(a), groupOf(b))
+  const claims = new Map<NodeId, Set<NodeId>>()
+  for (const row of accepted) {
+    const short = partOf(row)
+    if (short === undefined) continue
+    const long = short === row.a ? row.b : row.a
+    claims.set(groupOf(short), (claims.get(groupOf(short)) ?? new Set()).add(groupOf(long)))
+  }
+  const confirmed = [...settled, ...accepted.filter((row) => { const short = partOf(row); return short !== undefined && claims.get(groupOf(short))!.size === 1 })]
   yield* Console.log(`${sameName.length} same-name pairs (merged without asking) · ${confirmed.filter((row) => !isVariant(row)).length - sameName.length} confirmed by Jev at 0.9 · ${confirmed.filter(isVariant).length} spelling variants at ${Floors.alias}`)
   // confirmed pairs → groups (a=b, b=c ⇒ one group), each merged into its best-held member
   const parent = new Map<NodeId, NodeId>()
