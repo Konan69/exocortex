@@ -186,8 +186,9 @@ export const backup = Effect.fn("backup")(function*(dir: Option.Option<string>) 
     .varAs("categories", g().nWithLabel("Chunk").where(tenantScope).outE("IN_CATEGORY").count())
     .returning(["mentions", "categories"]), Schema.Struct({ mentions: Schema.Finite, categories: Schema.Finite }))
   if (live.mentions !== mentions || live.categories !== categories) {
-    yield* fs.remove(target, { recursive: true })
-    return yield* new BrokenInvariant({ message: `backup incomplete (links ${mentions} of ${live.mentions}, categories ${categories} of ${live.categories}); removed ${target}, run it again` })
+    yield* Effect.forEach(Object.values(FILES), (file) => Effect.ignore(fs.remove(join(target, file))), { discard: true })
+    if (!(yield* fs.readDirectory(target)).length) yield* fs.remove(target, { recursive: true })
+    return yield* new BrokenInvariant({ message: `backup incomplete (links ${mentions} of ${live.mentions}, categories ${categories} of ${live.categories}); removed its files from ${target}, run it again` })
   }
   yield* Console.log(`${FILES.chunkMentions.padEnd(26)} ${mentions}\n${FILES.chunkCategories.padEnd(26)} ${categories}\n→ ${target}`)
 })
