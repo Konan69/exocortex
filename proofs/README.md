@@ -12,7 +12,7 @@ The runner builds the native engine locally with Cargo. To use an already-built 
 
 | Model | Finite domain | Safety property | Application binding |
 |---|---|---|---|
-| Publication | Two additive ingesters, one retry each, two new document IDs | A committed addition remains in the active corpus when another ingest publishes | `cli.ingestCommand` captures its base; `graph.activate` compares that head and updates it in one conditional `writeBatch` |
+| Publication | Two publishers, one retry each, an existing document and two new document IDs | The active corpus retains existing documents and committed additions | `cli.ingestCommand` captures its base; `graph.activate` requires the candidate to contain the base IDs, then compares that head and updates it in one conditional `writeBatch` |
 | Generation | Two builders, one retry each, two sources, one entity, alias and claim with its required links, one activator | A published generation is complete; a stopped build cannot change the old head | `graph.build` gives each attempt a fresh UUID scope, writes rows separately, then writes a finished marker; `graph.activate` validates before publication |
 | Mapping | Two entity observations; zero, one or multiple type/relation matches; every supported/unsupported verdict combination; entity/literal objects; valid/invalid evidence | Unmapped observations remain retained; unsupported or ambiguous observations cannot become published claims | `knowledge.validateRecord`, `mapExtraction`, `validateMapping`, `graph.project` and `build`'s mapped-claim verdict filter |
 | Revision | Exact corpus, changed hash, changed count and invalid record; compatible/incompatible ontology | A mismatched corpus is rejected, and incompatible structure is not reported as comparable | `graph.revise` checks its frozen corpus hash/count, then replays both definitions on those same records |
@@ -23,7 +23,7 @@ The first draft failed Publication: two callers read the old head, A published, 
 
 ## Assumptions and limits
 
-Each Helix `writeBatch` is assumed atomic, isolated and durably visible on acknowledged completion. The model never combines separate read/write calls into one transaction. Source records and completed generation scopes are immutable under this application; arbitrary external database edits are not modeled. UUIDs and application hashes are assumed collision-free. Publication abstracts generation identity as a monotonic version and models additive ingests, not deliberate manual rollback or replacement.
+Each Helix `writeBatch` is assumed atomic, isolated and durably visible on acknowledged completion. The model never combines separate read/write calls into one transaction. Source records and completed generation scopes are immutable under this application; arbitrary external database edits are not modeled. UUIDs and application hashes are assumed collision-free. Publication abstracts generation identity as a monotonic version and models complete additions and rejects candidates that omit existing IDs. It does not compare source text revisions or model a legacy writer changing the corpus during first activation.
 
 Failures occur between operations and retries are bounded as above. No liveness, arbitrary concurrency, exactly-once response delivery, storage-engine recovery or universal correctness for all TypeScript inputs is established. A full-corpus rebalance is a separate operation and remains incomplete until actually executed and reconciled.
 

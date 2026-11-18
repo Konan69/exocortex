@@ -32,6 +32,7 @@ for spec in ['Publication', 'Generation', 'Revision', 'Mapping']:
     }[spec])])
     if spec != 'Revision':
         checks.append((spec, spec + 'Reachable', 12, 'NeverPublishes'))
+checks.append(("Publication", "PublicationCoverageBroken", 12, "KeepsPublished"))
 results = []
 for spec, config, expected, invariant in checks:
     cfg = ROOT / 'proofs' / (config + '.cfg')

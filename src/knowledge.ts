@@ -153,7 +153,7 @@ export function validateRecord(record: ExtractionRecord): void {
       const spans = record.evidence[`${prefix}:${observation.id}`]
       if (!spans || spans.length !== observation.quotes.length) throw new Error("Evidence positions are missing")
       for (const [index, span] of spans.entries()) {
-        if (span.quote !== observation.quotes[index] || span.start < 0 || span.end <= span.start || record.source.content.slice(span.start, span.end) !== span.quote) throw new Error("Evidence position does not match the source")
+        if (span.quote !== observation.quotes[index] || span.start < 0 || span.end !== span.start + span.quote.length || record.source.content.slice(span.start, span.end) !== span.quote) throw new Error("Evidence position does not match the source")
       }
     }
   }

@@ -21,14 +21,14 @@ const recordsDir = Effect.gen(function*() {
 })
 
 const extractCommand = Command.make("extract", { directory }, ({ directory }) => Effect.gen(function*() {
-  const records = yield* extractCorpus(yield* sourcesIn(directory), yield* recordsDir)
-  yield* print({ documents: records.length, entities: records.reduce((sum, record) => sum + record.extraction.entities.length, 0), records: yield* recordsDir })
+  const { records, directory: runDirectory } = yield* extractCorpus(yield* sourcesIn(directory), yield* recordsDir)
+  yield* print({ documents: records.length, entities: records.reduce((sum, record) => sum + record.extraction.entities.length, 0), records: runDirectory })
 })).pipe(Command.withDescription("Extract observations without ontology mapping; retain text and evidence"))
 
 const rebalanceCommand = Command.make("rebalance", { directory, ontology: Flag.File("ontology", { mustExist: true }) }, ({ directory, ontology }) => Effect.gen(function*() {
   const definition = yield* readJSON(ontology, Ontology)
   yield* checked(() => validateOntology(definition))
-  const records = yield* extractCorpus(yield* sourcesIn(directory), yield* recordsDir)
+  const { records } = yield* extractCorpus(yield* sourcesIn(directory), yield* recordsDir)
   yield* Graph.build(records, definition)
 })).pipe(Command.withDescription("Rebuild the supplied complete corpus into an isolated generation; does not activate"))
 
@@ -43,7 +43,7 @@ const ingestCommand = Command.make("ingest", { directory, ontology: Flag.String(
   const definition = Option.isSome(input.ontology) ? yield* readJSON(input.ontology.value, Ontology)
     : current ? (yield* Graph.loadGeneration(current)).ontology : undefined
   if (!definition) return yield* Effect.fail(new Error("The first ingest requires --ontology <file>"))
-  const fresh = yield* extractCorpus(sources, yield* recordsDir)
+  const { records: fresh } = yield* extractCorpus(sources, yield* recordsDir)
   const combined = new Map(old.map(record => [record.source.id, record]))
   fresh.forEach(record => combined.set(record.source.id, record))
   const next = yield* Graph.build([...combined.values()], definition)
