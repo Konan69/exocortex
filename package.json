@@ -8,7 +8,7 @@
   "scripts": {
     "exo": "bun exo.ts",
     "typecheck": "tsc --noEmit",
-    "smoke": "bun scripts/smoke.ts"
+    "prove": "python3 scripts/prove.py"
   },
   "dependencies": {
     "@effect/ai-openai": "4.1.2",

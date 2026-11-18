@@ -1,6 +1,6 @@
 // Helix: the store, the indexes, and the only door to them. Every query is a v3 SDK batch posted to /v2/query,
 // decoded through the caller's schema here, so nothing inside kb handles raw Helix JSON.
-import { g, IndexSpec, parseJson, type ReadBatch, VectorDistanceMetric, type WriteBatch, writeBatch } from "@helix-db/helix-db"
+import { g, IndexSpec, parseJson, readBatch, type ReadBatch, VectorDistanceMetric, type WriteBatch, writeBatch } from "@helix-db/helix-db"
 import { Context, Effect, Layer, Schedule, Schema, Semaphore } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/http"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
@@ -14,33 +14,18 @@ export class HelixError extends Schema.TaggedError<HelixError>()("HelixError", {
 }) {}
 
 
-// Index DDL cannot share a batch with data, and builds are asynchronous: ensureIndexes asks until every receipt is
-// already_active. Entity.name is NOT text-indexed (Helix v0.0.5 loops building a text index over a populated label);
-// the EntityName shadow label carries the BM25 index instead, created while empty and maintained per write.
 const INDEXES: ReadonlyArray<readonly [string, IndexSpec]> = [
-  ["doc_id", IndexSpec.nodeEquality("SourceDocument", "documentId")],
-  ["doc_status", IndexSpec.nodeEquality("SourceDocument", "status")],
-  ["doc_kind", IndexSpec.nodeEquality("SourceDocument", "kind")],
-  ["doc_source", IndexSpec.nodeEquality("SourceDocument", "source")],
-  ["doc_title_txt", IndexSpec.nodeText("SourceDocument", "title", "tenant_id")],
-  ["chunk_doc", IndexSpec.nodeEquality("Chunk", "documentId")],
-  ["chunk_id", IndexSpec.nodeEquality("Chunk", "chunkId")],
-  ["chunk_kind", IndexSpec.nodeEquality("Chunk", "documentKind")],
-  ["chunk_source", IndexSpec.nodeEquality("Chunk", "source")],
-  ["chunk_category", IndexSpec.nodeEquality("Chunk", "category")],
-  ["chunk_owner", IndexSpec.nodeEquality("Chunk", "aboutOwner")],
-  ["chunk_salience", IndexSpec.nodeRange("Chunk", "salience")],
-  ["chunk_vec", IndexSpec.nodeVector("Chunk", "embedding", 1536, VectorDistanceMetric.Cosine, "tenant_id")],
-  ["chunk_txt", IndexSpec.nodeText("Chunk", "content", "tenant_id")],
-  ["chunk_naming", IndexSpec.nodeEquality("Chunk", "needsNaming")],
-  ["chunk_hash", IndexSpec.nodeEquality("Chunk", "contentHash")],
-  ["cat_key", IndexSpec.nodeUniqueEquality("Category", "categoryKey")],
-  ["ent_key", IndexSpec.nodeEquality("Entity", "entityKey")],
-  ["entity_name_key", IndexSpec.nodeUniqueEquality("EntityName", "entityKey")],
-  ["entity_name_txt", IndexSpec.nodeText("EntityName", "name", "tenant_id")],
+  ...["KnowledgeHead", "KnowledgeGeneration", "KnowledgeSource", "KnowledgeEntity", "KnowledgeAlias", "KnowledgeClaim"].flatMap(label => [
+    [`${label}_key`, IndexSpec.nodeUniqueEquality(label, "key")] as const,
+    [`${label}_scope`, IndexSpec.nodeEquality(label, "scope")] as const,
+  ]),
+  ["knowledge_source_text", IndexSpec.nodeText("KnowledgeSource", "content", "scope")],
+  ["knowledge_source_title", IndexSpec.nodeText("KnowledgeSource", "title", "scope")],
+  ["knowledge_alias_name", IndexSpec.nodeEquality("KnowledgeAlias", "name")],
+  ["knowledge_claim_vector", IndexSpec.nodeVector("KnowledgeClaim", "embedding", 1536, VectorDistanceMetric.Cosine, "scope")],
 ]
 
-const IndexReceipts = Schema.Record(Schema.String, Schema.Struct({ kind: Schema.String }))
+const IndexReceipts = Schema.Record(Schema.String, Schema.Struct({ kind: Schema.String, operation_id: Schema.optional(Schema.String) }))
 
 /** Helix is one writer: a busy writer answers 409; the server and transport fail transiently. */
 const isTransient = (error: HelixError) =>
@@ -131,9 +116,15 @@ export class Helix extends Context.Service<Helix, {
         const receipts = yield* writeReturning("ensure_indexes", createIndexes, IndexReceipts)
         const building = Object.entries(receipts).filter(([, receipt]) => receipt.kind !== "already_active").map(([name]) => name)
         if (!building.length) return
-        if (attempt > 200) return yield* new HelixError({ query: "ensure_indexes", message: `indexes never became active: ${building.join(", ")}` })
-        if (building.some((name) => name.startsWith("entity_name_")) && attempt >= 40) {
-          return yield* new HelixError({ query: "ensure_indexes", message: `EntityName indexes did not activate within two minutes (${building.join(", ")}); Helix v0.0.5 index-build bug, do not index Entity.name directly` })
+        let pending = readBatch()
+        const jobs: string[] = []
+        for (const name of building) {
+          const operation = receipts[name]?.operation_id
+          if (operation) { pending = pending.varAs(name, g().getIndexOperation(operation)); jobs.push(name) }
+        }
+        if (jobs.length) {
+          const states = yield* read("index_progress", pending.returning(jobs), Schema.Record(Schema.String, Schema.Struct({ status: Schema.String, message: Schema.optional(Schema.NullOr(Schema.String)), blocker_code: Schema.optional(Schema.String) })))
+          for (const [name, state] of Object.entries(states)) if (state.status === "blocked" || state.status === "aborted") return yield* new HelixError({ query: "ensure_indexes", message: `${name}: ${state.status}: ${state.blocker_code ?? state.message ?? "inspect the index operation"}` })
         }
         if (attempt % 5 === 0) yield* Effect.logInfo(`waiting for indexes: ${building.join(", ")}`)
         yield* Effect.sleep("3 seconds")
