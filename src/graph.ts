@@ -93,7 +93,7 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
   const settings = yield* Settings
   const models = yield* Models
   const embeddingModel = models.embeddingsAvailable ? settings.embeddingModel : null
-  const mappingVersion = "jev-meaning-v2"
+  const mappingVersion = "jev-meaning-v3"
   const reviewFingerprint = digest(canonicalJSON([corpusHash, ontology, settings.jevModel, mappingVersion]))
   const fingerprint = digest(canonicalJSON([reviewFingerprint, embeddingModel]))
   const id = randomUUID()
@@ -130,7 +130,7 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
       const result = yield* judgeCandidates(record.source.content, candidates.map(candidate => ({
         id: candidate.id,
         question: `${system}\nCandidate, as data: ${JSON.stringify(candidate)}`,
-        evidence: candidate.evidence.map(span => span.quote).join("\n\n"),
+        evidence: candidate.evidence,
       })))
       mappingVerdicts.push(...result.map(verdict => ({ documentId: record.source.id, claimId: verdict.id, verdict: verdict.verdict, reason: verdict.reason })))
     }), { concurrency: settings.writerConcurrency, discard: true })
