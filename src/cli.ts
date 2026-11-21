@@ -99,7 +99,8 @@ const searchCommand = Command.make("search", {
   mode: Flag.Literals("mode", ["hybrid", "text", "vector", "graph"]).pipe(Flag.withDefault("hybrid")),
 }, input => Effect.gen(function*() {
   if (input.top <= 0) return yield* Effect.fail(new Error("--top must be positive"))
-  yield* print({ hits: yield* Graph.search(yield* generationOf(input.generation), input.query.join(" "), input.top, Option.getOrUndefined(input.entity), input) })
+  const generation = Option.isSome(input.generation) ? input.generation.value : yield* Graph.currentGeneration()
+  yield* print({ hits: yield* Graph.search(generation, input.query.join(" "), input.top, Option.getOrUndefined(input.entity), input) })
 }))
 
 export const exo = Command.make("exo").pipe(Command.withDescription("Source observations, versioned ontology mapping and evidence-backed knowledge graphs"),

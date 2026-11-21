@@ -255,8 +255,68 @@ export const claims = Effect.fn("claims")(function*(generation: string, entityId
   return result.rows ?? []
 })
 
-export const search = Effect.fn("search")(function*(generation: string, query: string, top: number, entity?: string,
-  filters: { kinds: ReadonlyArray<string>; sources: ReadonlyArray<string>; documents: ReadonlyArray<string>; mode?: "hybrid" | "text" | "vector" | "graph" } = { kinds: [], sources: [], documents: [] }) {
+const Hit = Schema.Struct({ documentId: Schema.String, title: Schema.String, kind: Schema.String, source: Schema.String })
+const hitFields = props("documentId", "title", "kind", "source")
+type SearchFilters = { kinds: ReadonlyArray<string>; sources: ReadonlyArray<string>; documents: ReadonlyArray<string>; mode?: "hybrid" | "text" | "vector" | "graph" }
+
+const rankSources = (channels: readonly (readonly (typeof Hit.Type)[])[], top: number) => {
+  const ranked = new Map<string, typeof Hit.Type & { score: number }>()
+  for (const channel of channels) for (const [rank, hit] of channel.entries()) {
+    ranked.set(hit.documentId, { ...hit, score: (ranked.get(hit.documentId)?.score ?? 0) + 1 / (60 + rank + 1) })
+  }
+  return [...ranked.values()].sort((a, b) => b.score - a.score).slice(0, top)
+}
+
+const searchLegacy = Effect.fn("searchLegacy")(function*(query: string, top: number, entity: string | undefined, filters: SearchFilters) {
+  const helix = yield* Helix
+  const owner = tenant()
+  const scope = Predicate.eq("tenant_id", owner)
+  const mode = filters.mode ?? "hybrid"
+  const documentFilter = Predicate.and([
+    scope,
+    ...(filters.kinds.length ? [Predicate.isIn("kind", [...filters.kinds])] : []),
+    ...(filters.sources.length ? [Predicate.isIn("source", [...filters.sources])] : []),
+    ...(filters.documents.length ? [Predicate.isIn("documentId", [...filters.documents])] : []),
+  ])
+  const mentionedBy = Effect.fnUntraced(function*(name: string) {
+    const index = g().textSearchNodes("EntityName", "name", name, 16, owner).project(props("entityKey", "name"))
+    const result = yield* helix.read("legacy_names", readBatch().varAs("rows", index).returning(["rows"]),
+      Rows(Schema.Struct({ entityKey: Schema.String, name: Schema.String })))
+    const keys = (result.rows ?? []).filter(row => lookupName(row.name) === lookupName(name)).map(row => row.entityKey)
+    if (!keys.length) return []
+    const mentions = g().nWithLabelWhere("Entity", Predicate.isIn("entityKey", keys)).where(scope).in("MENTIONS").where(scope)
+      .union([sub().hasLabel("SourceDocument"), sub().hasLabel("Chunk").in("HAS_CHUNK")])
+      .hasLabel("SourceDocument").where(documentFilter).dedup().project(hitFields)
+    return (yield* helix.read("legacy_mentions", readBatch().varAs("rows", mentions).returning(["rows"]), Rows(Hit))).rows ?? []
+  })
+  const allowed = entity ? (yield* mentionedBy(entity)).map(row => row.documentId) : undefined
+  if (allowed && !allowed.length) return []
+  const sourceFilter = allowed ? Predicate.and([documentFilter, Predicate.isIn("documentId", allowed)]) : documentFilter
+  const sources = g().nWithLabelWhere("SourceDocument", sourceFilter)
+  const chunks = sources.out("HAS_CHUNK").where(scope)
+  const filtered = Boolean(allowed || filters.kinds.length || filters.sources.length || filters.documents.length)
+  const channels: (readonly (typeof Hit.Type)[])[] = []
+  if (mode === "hybrid" || mode === "text") {
+    const title = filtered ? sources.textSearch("SourceDocument", "title", query, top, owner) : g().textSearchNodes("SourceDocument", "title", query, top, owner)
+    const content = filtered ? chunks.textSearch("Chunk", "content", query, top * 4, owner) : g().textSearchNodes("Chunk", "content", query, top * 4, owner)
+    const rows = Schema.NullOr(Schema.Array(Hit))
+    const result = yield* helix.read("legacy_text", readBatch()
+      .varAs("content", content.in("HAS_CHUNK").where(sourceFilter).dedup().limit(top).project(hitFields))
+      .varAs("title", title.project(hitFields))
+      .returning(["content", "title"]), Schema.Struct({ content: rows, title: rows }))
+    channels.push(result.content ?? [], result.title ?? [])
+  }
+  if (mode === "hybrid" || mode === "graph") {
+    const related = yield* mentionedBy(query)
+    channels.push(related.filter(hit => !allowed || allowed.includes(hit.documentId)).slice(0, top))
+  }
+  if (mode === "vector") return yield* Effect.fail(new Error("Vector search needs an active knowledge generation with claim embeddings. Use text or graph search on the existing corpus."))
+  return rankSources(channels, top)
+})
+
+export const search = Effect.fn("search")(function*(generation: string | undefined, query: string, top: number, entity?: string,
+  filters: SearchFilters = { kinds: [], sources: [], documents: [] }) {
+  if (generation === undefined) return yield* searchLegacy(query, top, entity, filters)
   const helix = yield* Helix
   const models = yield* Models
   const scope = `${tenant()}:${generation}`
@@ -273,8 +333,7 @@ export const search = Effect.fn("search")(function*(generation: string, query: s
     ...(filters.documents.length ? [Predicate.isIn("documentId", [...filters.documents])] : []),
   ])
   const sources = g().nWithLabelWhere("KnowledgeSource", sourceFilter)
-  const Hit = Schema.Struct({ documentId: Schema.String, title: Schema.String, kind: Schema.String, source: Schema.String })
-  const fields = props("documentId", "title", "kind", "source")
+  const fields = hitFields
   const channels: (readonly (typeof Hit.Type)[])[] = []
   if (mode === "hybrid" || mode === "text") {
     const rows = Schema.NullOr(Schema.Array(Hit))
@@ -315,9 +374,5 @@ export const search = Effect.fn("search")(function*(generation: string, query: s
     } else if (mode === "vector") return yield* Effect.fail(new Error("Vector retrieval requires claim embeddings in this generation and OPENAI_API_KEY"))
     else yield* Console.error("Vector channel unavailable; using text and graph retrieval.")
   }
-  const ranked = new Map<string, typeof Hit.Type & { score: number }>()
-  for (const channel of channels) for (const [rank, hit] of channel.entries()) {
-    ranked.set(hit.documentId, { ...hit, score: (ranked.get(hit.documentId)?.score ?? 0) + 1 / (60 + rank + 1) })
-  }
-  return [...ranked.values()].sort((a, b) => b.score - a.score).slice(0, top)
+  return rankSources(channels, top)
 })
