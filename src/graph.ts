@@ -97,15 +97,13 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
       }
       for (const name of new Set([raw.name, ...raw.aliases].map(lookupName))) {
         const bucket = canonicalJSON([type.name, name])
-        const matches = names.get(bucket) ?? []
-        for (const match of matches) {
-          if (match.key === id || match.source.id === record.source.id) continue
-          const [left, right] = match.key < id ? [match, observation] : [observation, match]
-          const candidateId = digest(canonicalJSON([type, left.key, right.key]))
-          if (!candidates.has(candidateId)) candidates.set(candidateId, { id: candidateId, type, left, right })
-        }
-        matches.push(observation)
-        names.set(bucket, matches)
+        // Pair each observation with the bucket's first one only: n-1 reviews per name, not n².
+        const anchor = names.get(bucket)?.[0]
+        if (!anchor) { names.set(bucket, [observation]); continue }
+        if (anchor.key === id || anchor.source.id === record.source.id) continue
+        const [left, right] = anchor.key < id ? [anchor, observation] : [observation, anchor]
+        const candidateId = digest(canonicalJSON([type, left.key, right.key]))
+        if (!candidates.has(candidateId)) candidates.set(candidateId, { id: candidateId, type, left, right })
       }
     }
     for (const mapped of mapping.claims) {
@@ -119,9 +117,10 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
     }
   }
   const supported = new Set(verdicts.filter(verdict => verdict.verdict === "supported").map(verdict => verdict.id))
+  const refuted = new Set(verdicts.filter(verdict => verdict.verdict === "refuted").map(verdict => verdict.id))
   const held = new Map<string, Set<string>>()
   for (const { id, left, right } of candidates.values()) {
-    if (supported.has(id)) continue
+    if (!refuted.has(id)) continue
     for (const [key, peer] of [[left.key, right.key], [right.key, left.key]] as const) {
       const peers = held.get(key) ?? new Set<string>()
       peers.add(peer)
