@@ -21,8 +21,13 @@ const INDEXES: ReadonlyArray<readonly [string, IndexSpec]> = [
   ]),
   ["knowledge_source_text", IndexSpec.nodeText("KnowledgeSource", "content", "scope")],
   ["knowledge_source_title", IndexSpec.nodeText("KnowledgeSource", "title", "scope")],
+  ["knowledge_source_document", IndexSpec.nodeEquality("KnowledgeSource", "documentId")],
+  ["knowledge_source_kind", IndexSpec.nodeEquality("KnowledgeSource", "kind")],
+  ["knowledge_source_origin", IndexSpec.nodeEquality("KnowledgeSource", "source")],
+  ["knowledge_generation_fingerprint", IndexSpec.nodeEquality("KnowledgeGeneration", "fingerprint")],
   ["knowledge_alias_name", IndexSpec.nodeEquality("KnowledgeAlias", "name")],
   ["knowledge_claim_vector", IndexSpec.nodeVector("KnowledgeClaim", "embedding", 1536, VectorDistanceMetric.Cosine, "scope")],
+  ["legacy_source_tenant", IndexSpec.nodeEquality("SourceDocument", "tenant_id")],
 ]
 
 const IndexReceipts = Schema.Record(Schema.String, Schema.Struct({ kind: Schema.String, operation_id: Schema.optional(Schema.String) }))

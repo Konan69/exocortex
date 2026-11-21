@@ -1,4 +1,4 @@
-import { BatchCondition, g, NodeRef, Predicate, PropertyProjection, PropertyValue, readBatch, writeBatch } from "@helix-db/helix-db"
+import { BatchCondition, g, NodeRef, Predicate, PropertyProjection, PropertyValue, readBatch, sub, writeBatch } from "@helix-db/helix-db"
 import { randomUUID } from "node:crypto"
 import { Array as Arr, Console, Effect, Schema } from "effect"
 import { mkdir } from "node:fs/promises"
@@ -101,7 +101,7 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
   const projected = yield* checked(() => project(records, ontology))
   const helix = yield* Helix
   yield* helix.ensureIndexes
-  const existing = yield* helix.read("generation_exists", readBatch().varAs("rows", g().nWithLabel("KnowledgeGeneration").where(Predicate.and([Predicate.eq("tenant_id", tenant()), Predicate.eq("fingerprint", fingerprint)])).limit(1).project(props("payload"))).returning(["rows"]), Rows(Payload))
+  const existing = yield* helix.read("generation_exists", readBatch().varAs("rows", g().nWithLabelWhere("KnowledgeGeneration", Predicate.eq("fingerprint", fingerprint)).where(Predicate.eq("tenant_id", tenant())).limit(1).project(props("payload"))).returning(["rows"]), Rows(Payload))
   if (existing.rows?.[0]) {
     const generation = yield* checked(() => Schema.decodeUnknownSync(Generation)(JSON.parse(existing.rows![0]!.payload)))
     yield* Console.log(JSON.stringify({ generation: generation.id, documents: generation.documents, entities: generation.entities, claims: generation.claims, heldClaims: generation.unmappedClaims }))
@@ -194,7 +194,7 @@ export const activate = Effect.fn("activate")(function*(id: string, expectedHead
   if (storedClaims.length !== generation.claims || storedEntities.length !== generation.entities || storedClaims.some(claim => !supported.has(claim.id))) return yield* Effect.fail(new Error("Stored projection does not match the finished generation"))
   const helix = yield* Helix
   const required = expectedHead === null
-    ? (yield* helix.read("legacy_corpus_ids", readBatch().varAs("rows", g().nWithLabel("SourceDocument").where(Predicate.eq("tenant_id", tenant())).project(props("documentId"))).returning(["rows"]), Rows(Schema.Struct({ documentId: Schema.String })))).rows?.map(row => row.documentId) ?? []
+    ? (yield* helix.read("legacy_corpus_ids", readBatch().varAs("rows", g().nWithLabelWhere("SourceDocument", Predicate.eq("tenant_id", tenant())).project(props("documentId"))).returning(["rows"]), Rows(Schema.Struct({ documentId: Schema.String })))).rows?.map(row => row.documentId) ?? []
     : (yield* generationRecords(expectedHead)).map(record => record.source.id)
   const candidateIds = new Set(records.map(record => record.source.id))
   const missing = required.filter(documentId => !candidateIds.has(documentId))
@@ -233,8 +233,9 @@ export const entities = Effect.fn("entities")(function*(generation: string, name
   const scope = `${tenant()}:${generation}`
   let traversal = g().nWithLabel("KnowledgeEntity").where(Predicate.eq("scope", scope))
   if (name) {
-    const aliases = yield* helix.read("resolve_alias", readBatch().varAs("rows", g().nWithLabel("KnowledgeAlias").where(Predicate.and([Predicate.eq("scope", scope), Predicate.eq("name", lookupName(name))])).project(props("entityId"))).returning(["rows"]), Rows(Schema.Struct({ entityId: Schema.String })))
-    traversal = traversal.where(Predicate.isIn("entityId", (aliases.rows ?? []).map(alias => alias.entityId)))
+    const aliases = yield* helix.read("resolve_alias", readBatch().varAs("rows", g().nWithLabelWhere("KnowledgeAlias", Predicate.eq("name", lookupName(name))).where(Predicate.eq("scope", scope)).project(props("entityId"))).returning(["rows"]), Rows(Schema.Struct({ entityId: Schema.String })))
+    if (!aliases.rows?.length) return []
+    traversal = g().nWithLabelWhere("KnowledgeEntity", Predicate.isIn("key", aliases.rows.map(alias => `${scope}:${alias.entityId}`)))
   }
   const result = yield* helix.read("entities", readBatch().varAs("rows", traversal.project(props("entityId", "name", "type", "aliases", "documents"))).returning(["rows"]), Rows(EntityView))
   return result.rows ?? []
@@ -242,8 +243,11 @@ export const entities = Effect.fn("entities")(function*(generation: string, name
 
 export const claims = Effect.fn("claims")(function*(generation: string, entityIds: ReadonlyArray<string> = []) {
   const helix = yield* Helix
-  let traversal = g().nWithLabel("KnowledgeClaim").where(Predicate.eq("scope", `${tenant()}:${generation}`))
-  if (entityIds.length) traversal = traversal.where(Predicate.or([Predicate.isIn("subject", [...entityIds]), Predicate.isIn("object", [...entityIds])]))
+  const scope = `${tenant()}:${generation}`
+  const traversal = entityIds.length
+    ? g().nWithLabelWhere("KnowledgeEntity", Predicate.isIn("key", entityIds.map(id => `${scope}:${id}`)))
+      .union([sub().in("SUBJECT"), sub().in("OBJECT")]).dedup().hasLabel("KnowledgeClaim").where(Predicate.eq("scope", scope))
+    : g().nWithLabelWhere("KnowledgeClaim", Predicate.eq("scope", scope))
   const result = yield* helix.read("claims", readBatch().varAs("rows", traversal.project(props("id", "documentId", "subject", "object", "value", "relation", "statement", "evidence", "qualifiers"))).returning(["rows"]), Rows(Schema.Struct({
     id: Schema.String, documentId: Schema.String, subject: Schema.String, object: Schema.NullOr(Schema.String), value: Schema.NullOr(Schema.String), relation: Schema.String,
     statement: Schema.String, evidence: Schema.String, qualifiers: Schema.String,
@@ -257,26 +261,38 @@ export const search = Effect.fn("search")(function*(generation: string, query: s
   const models = yield* Models
   const scope = `${tenant()}:${generation}`
   const mode = filters.mode ?? "hybrid"
-  const resolved = entity ? yield* entities(generation, entity) : []
-  const allowed = entity ? new Set(resolved.flatMap(entity => entity.documents)) : undefined
   const metadata = yield* loadGeneration(generation)
+  const resolved = entity ? yield* entities(generation, entity) : []
+  const allowed = [...new Set(resolved.flatMap(match => match.documents))]
+  if (entity && !allowed.length) return []
+  const sourceFilter = Predicate.and([
+    Predicate.eq("scope", scope),
+    ...(entity ? [Predicate.isIn("documentId", allowed)] : []),
+    ...(filters.kinds.length ? [Predicate.isIn("kind", [...filters.kinds])] : []),
+    ...(filters.sources.length ? [Predicate.isIn("source", [...filters.sources])] : []),
+    ...(filters.documents.length ? [Predicate.isIn("documentId", [...filters.documents])] : []),
+  ])
+  const sources = g().nWithLabelWhere("KnowledgeSource", sourceFilter)
   const Hit = Schema.Struct({ documentId: Schema.String, title: Schema.String, kind: Schema.String, source: Schema.String })
-  const documents = yield* helix.read("search_scope", readBatch().varAs("rows", g().nWithLabel("KnowledgeSource").where(Predicate.eq("scope", scope)).project(props("documentId", "title", "kind", "source"))).returning(["rows"]), Rows(Hit))
-  const eligible = new Map((documents.rows ?? []).filter(hit => (!allowed || allowed.has(hit.documentId))
-    && (!filters.kinds.length || filters.kinds.includes(hit.kind))
-    && (!filters.sources.length || filters.sources.includes(hit.source))
-    && (!filters.documents.length || filters.documents.includes(hit.documentId))).map(hit => [hit.documentId, hit]))
-  const channels: string[][] = []
+  const fields = props("documentId", "title", "kind", "source")
+  const channels: (readonly (typeof Hit.Type)[])[] = []
   if (mode === "hybrid" || mode === "text") {
+    const rows = Schema.NullOr(Schema.Array(Hit))
     const result = yield* helix.read("search_text", readBatch()
-      .varAs("content", g().textSearchNodes("KnowledgeSource", "content", query, metadata.documents, scope).project(props("documentId")))
-      .varAs("title", g().textSearchNodes("KnowledgeSource", "title", query, metadata.documents, scope).project(props("documentId")))
-      .returning(["content", "title"]), Schema.Struct({ content: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String }))), title: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String }))) }))
-    channels.push((result.content ?? []).map(hit => hit.documentId), (result.title ?? []).map(hit => hit.documentId))
+      .varAs("content", sources.textSearch("KnowledgeSource", "content", query, top, scope).project(fields))
+      .varAs("title", sources.textSearch("KnowledgeSource", "title", query, top, scope).project(fields))
+      .returning(["content", "title"]), Schema.Struct({ content: rows, title: rows }))
+    channels.push(result.content ?? [], result.title ?? [])
   }
   if (mode === "hybrid" || mode === "graph") {
     const named = yield* entities(generation, query)
-    channels.push([...new Set(named.flatMap(entity => entity.documents))])
+    if (named.length) {
+      const related = g().nWithLabelWhere("KnowledgeEntity", Predicate.isIn("key", named.map(match => `${scope}:${match.entityId}`)))
+        .union([sub().in("SUBJECT"), sub().in("OBJECT")]).out("EVIDENCE").hasLabel("KnowledgeSource")
+        .where(sourceFilter).dedup().limit(top)
+      const result = yield* helix.read("search_graph", readBatch().varAs("rows", related.project(fields)).returning(["rows"]), Rows(Hit))
+      channels.push(result.rows ?? [])
+    }
   }
   if (mode === "hybrid" || mode === "vector") {
     if (metadata.embeddingModel && models.embeddingsAvailable && metadata.claims > 0) {
@@ -284,15 +300,24 @@ export const search = Effect.fn("search")(function*(generation: string, query: s
       if (metadata.embeddingModel !== settings.embeddingModel) return yield* Effect.fail(new Error("Generation uses a different embedding model; rebuild its retrieval vectors before querying"))
       const vectors = yield* models.embed([query])
       if (vectors.length !== 1 || vectors[0]?.length !== settings.dimensions) return yield* Effect.fail(new Error("Missing query embedding"))
-      const result = yield* helix.read("search_vector", readBatch().varAs("rows",
-        g().nWithLabel("KnowledgeClaim").where(Predicate.and([Predicate.eq("scope", scope), Predicate.isIn("documentId", [...eligible.keys()])]))
-          .vectorSearchWith("KnowledgeClaim", "embedding", PropertyValue.f32Array([...vectors[0]]), metadata.claims, scope).project(props("documentId")))
-        .returning(["rows"]), Rows(Schema.Struct({ documentId: Schema.String })))
-      channels.push((result.rows ?? []).map(hit => hit.documentId))
+      const candidates = sources.in("EVIDENCE").hasLabel("KnowledgeClaim").where(Predicate.eq("scope", scope)).dedup()
+      for (let k = Math.min(top, metadata.claims); ; k = Math.min(k * 2, metadata.claims)) {
+        const result = yield* helix.read("search_vector", readBatch().varAs("rows", candidates
+          .vectorSearchWith("KnowledgeClaim", "embedding", PropertyValue.f32Array([...vectors[0]]), k, scope)
+          .out("EVIDENCE").hasLabel("KnowledgeSource").where(sourceFilter).dedup().limit(top).project(fields))
+          .returning(["rows"]), Rows(Hit))
+        const hits = result.rows ?? []
+        if (hits.length >= top || k === metadata.claims) {
+          channels.push(hits)
+          break
+        }
+      }
     } else if (mode === "vector") return yield* Effect.fail(new Error("Vector retrieval requires claim embeddings in this generation and OPENAI_API_KEY"))
     else yield* Console.error("Vector channel unavailable; using text and graph retrieval.")
   }
-  const scores = new Map<string, number>()
-  for (const channel of channels) for (const [rank, id] of [...new Set(channel)].filter(id => eligible.has(id)).entries()) scores.set(id, (scores.get(id) ?? 0) + 1 / (60 + rank + 1))
-  return [...scores].sort((a, b) => b[1] - a[1]).slice(0, top).map(([id, score]) => ({ ...eligible.get(id)!, score }))
+  const ranked = new Map<string, typeof Hit.Type & { score: number }>()
+  for (const channel of channels) for (const [rank, hit] of channel.entries()) {
+    ranked.set(hit.documentId, { ...hit, score: (ranked.get(hit.documentId)?.score ?? 0) + 1 / (60 + rank + 1) })
+  }
+  return [...ranked.values()].sort((a, b) => b.score - a.score).slice(0, top)
 })
