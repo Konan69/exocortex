@@ -21,11 +21,16 @@ type SourceFilters = {
   kinds: ReadonlyArray<string>; sources: ReadonlyArray<string>; documents: ReadonlyArray<string>
   categories?: ReadonlyArray<string>; minSalience?: number
 }
+const normalizeCategory = (category: string) =>
+  category.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().trim()
+    .replace(/[’'`]/g, "")
+    .replace(/\b(ltd|limited|inc|llc|plc|gmbh|corp|corporation|co)\b\.?/g, "")
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
 const sourcePredicates = (filters: SourceFilters) => [
   ...(filters.kinds.length ? [Predicate.isIn("kind", [...filters.kinds])] : []),
   ...(filters.sources.length ? [Predicate.isIn("source", [...filters.sources])] : []),
   ...(filters.documents.length ? [Predicate.isIn("documentId", [...filters.documents])] : []),
-  ...(filters.categories?.length ? [Predicate.isIn("category", [...filters.categories])] : []),
+  ...(filters.categories?.length ? [Predicate.isIn("category", filters.categories.map(normalizeCategory))] : []),
   ...(filters.minSalience !== undefined ? [Predicate.gte("salience", filters.minSalience)] : []),
 ]
 const keyed = (label: string, key: string) => g().nWithLabelWhere(label, Predicate.eq("key", key))
@@ -237,9 +242,12 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Generat
       if (!hasExtraction(record) && digest(record.source.content) !== record.sourceHash) throw new Error(`Source checksum mismatch for ${record.source.id}`)
     }
   })
+  const models = yield* Models
+  if (options.previous?.generation.embeddingModel && !models.embeddingsAvailable) {
+    return yield* Effect.fail(new Error("OPENAI_API_KEY is required to rebuild the active generation's claim embeddings"))
+  }
   const corpusHash = corpusHashOf(records)
   const settings = yield* Settings
-  const models = yield* Models
   const embeddingModel = models.embeddingsAvailable ? settings.embeddingModel : null
   const mappingVersion = "jev-meaning-v3"
   const reviewFingerprint = digest(canonicalJSON([corpusHashOf(extracted), ontology, settings.jevModel, mappingVersion]))
@@ -626,6 +634,7 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   ])
   const sources = g().nWithLabelWhere("KnowledgeSource", sourceFilter)
   const channels: (readonly SearchMatch[])[] = []
+  const titleMatches = new Set<string>()
   if (mode === "hybrid" || mode === "text") {
     const content = g().nWithLabelWhere("KnowledgeText", sourceFilter).textSearch("KnowledgeText", "content", query, top * 4, scope)
     const result = yield* helix.read("search_text", readBatch()
@@ -634,6 +643,7 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
       ]))
       .varAs("title", sources.textSearch("KnowledgeSource", "title", query, top, scope).project(hitFields))
       .returning(["content", "title"]), Schema.Struct({ content: Schema.NullOr(Schema.Array(TextHit)), title: Schema.NullOr(Schema.Array(Hit)) }))
+    for (const hit of result.title ?? []) titleMatches.add(hit.documentId)
     channels.push(result.content ?? [], result.title ?? [])
   }
   if (mode === "hybrid" || mode === "graph") {
@@ -683,7 +693,8 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   const hits = rankSources(channels, top)
   if (!hits.length) return hits
   const matchedSources = g().nWithLabelWhere("KnowledgeSource", Predicate.isIn("key", hits.map(hit => `${scope}:${hit.documentId}`)))
-  const openingKeys = hits.filter(hit => hit.passage === null).map(hit => `${scope}:${hit.documentId}:0`)
+  const openingKeys = hits.filter(hit => hit.passage === null && titleMatches.has(hit.documentId))
+    .map(hit => `${scope}:${hit.documentId}:0`)
   const result = yield* helix.read("search_hit_details", readBatch()
     .varAs("entities", matchedSources.bind("document").in("OCCURS_IN").hasLabel("KnowledgeEntity").projectBindings([
       BindingProjection.binding("document", "documentId", "documentId"),

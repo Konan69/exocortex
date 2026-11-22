@@ -1,7 +1,7 @@
 import { join } from "node:path"
 import { Console, Effect, Option } from "effect"
 import { Argument, Command, Flag } from "effect/cli"
-import { readBookmarks } from "./bookmarks.ts"
+import { ARTICLE_TEXT_SECTION, readBookmarks } from "./bookmarks.ts"
 import { Settings } from "./config.ts"
 import { Models } from "./ai.ts"
 import { checked, draftOntology, extractCorpus, readCorpus, readJSON, readRecords, saveJSON, sourcesIn } from "./extraction.ts"
@@ -171,9 +171,10 @@ const bookmarksCommand = Command.make("bookmarks", {
   }
 
   let added = 0, replaced = 0, updatedMetadata = 0
-  for (const { source } of rows.values()) {
+  for (const { source, enriched, hasArticleText } of rows.values()) {
     const old = combined.get(source.id)
-    if (!old || (input.replace && old.source.content !== source.content)) {
+    const canReplace = input.replace && enriched && (hasArticleText || !old?.source.content.includes(ARTICLE_TEXT_SECTION))
+    if (!old || (canReplace && old.source.content !== source.content)) {
       combined.set(source.id, pendingRecord(source))
       if (old) replaced++
       else added++

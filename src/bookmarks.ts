@@ -5,6 +5,8 @@ import { Effect, Option, Schema } from "effect"
 import { io } from "./extraction.ts"
 import { canonicalJSON, digest, type Source } from "./knowledge.ts"
 
+export const ARTICLE_TEXT_SECTION = "Article text:\n"
+
 const Links = Schema.Array(Schema.String)
 const Post = Schema.Struct({
   url: Schema.String,
@@ -53,7 +55,7 @@ export const readBookmarks = Effect.fn("readBookmarks")(function*(options: {
     ).all())
   })
   const byId = new Map(extras.map(row => [row.id, row]))
-  const rows = new Map<string, { source: Source; article: boolean }>()
+  const rows = new Map<string, { source: Source; article: boolean; enriched: boolean; hasArticleText: boolean }>()
   let skipped = 0
   for (const [index, line] of sourceLines.entries()) {
     if (!line.trim()) continue
@@ -74,10 +76,12 @@ export const readBookmarks = Effect.fn("readBookmarks")(function*(options: {
       quote?.text ? `Quoted post by ${byline(quote)}:\n${quote.text}` : "",
       links.length ? `Links:\n${links.join("\n")}` : "",
       extra?.article_title ? `Article: ${extra.article_title}` : "",
-      articleText ? `Article text:\n${articleText}` : "",
+      articleText ? ARTICLE_TEXT_SECTION + articleText : "",
     ].filter(Boolean).join("\n\n").toWellFormed()
     rows.set(id, {
       article: articleText.trim().length > 200,
+      enriched: extra !== undefined,
+      hasArticleText: Boolean(articleText.trim()),
       source: {
         id, kind: "x_bookmark", source: "x", url: post.url.toWellFormed(), content,
         title: `@${post.authorHandle || "unknown"}: ${post.text.trim().replace(/\s+/g, " ").slice(0, 80)}`.toWellFormed(),
