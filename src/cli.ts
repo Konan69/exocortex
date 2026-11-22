@@ -92,6 +92,17 @@ const walkCommand = Command.make("walk", { name: Argument.String("name"), genera
   if (!matches.length) return yield* Effect.fail(new Error(`No entity named ${input.name}`))
   yield* print({ entities: matches, claims: yield* Graph.claims(generation, matches.map(entity => entity.entityId)) })
 })).pipe(Command.withDescription("Supported incoming and outgoing claims, with direction and source evidence"))
+const excerpt = (passage: string, query: string) => {
+  const text = passage.replace(/\s+/g, " ").trim()
+  if (text.length <= 500) return text
+  const folded = text.toLocaleLowerCase()
+  const exact = folded.indexOf(query.toLocaleLowerCase())
+  const word = query.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu)?.findLast(term => folded.includes(term))
+  const match = exact >= 0 ? exact : word ? folded.indexOf(word) : 0
+  const start = Math.max(0, match - 100)
+  return `${start ? "…" : ""}${text.slice(start, start + 500)}${start + 500 < text.length ? "…" : ""}`
+}
+
 const searchCommand = Command.make("search", {
   query: Argument.String("query").pipe(Argument.variadic()), generation: selected, top: Flag.Int("top").pipe(Flag.withDefault(10)),
   entity: Flag.String("entity").pipe(Flag.optional), json,
@@ -100,7 +111,15 @@ const searchCommand = Command.make("search", {
 }, input => Effect.gen(function*() {
   if (input.top <= 0) return yield* Effect.fail(new Error("--top must be positive"))
   const generation = Option.isSome(input.generation) ? input.generation.value : yield* Graph.currentGeneration()
-  yield* print({ hits: yield* Graph.search(generation, input.query.join(" "), input.top, Option.getOrUndefined(input.entity), input) })
+  const query = input.query.join(" ").trim()
+  const hits = yield* Graph.search(generation, query, input.top, Option.getOrUndefined(input.entity), input)
+  if (input.json) return yield* print({ hits })
+  if (!hits.length) return yield* Console.log("Nothing found.")
+  for (const hit of hits) {
+    yield* Console.log(`\n${hit.title} [${hit.documentId}]  Score ${hit.score.toFixed(3)}`)
+    if (hit.entities.length) yield* Console.log(`   About ${hit.entities.join(" · ")}`)
+    if (hit.passage) yield* Console.log(`   ${excerpt(hit.passage, query)}`)
+  }
 }))
 
 export const exo = Command.make("exo").pipe(Command.withDescription("Source observations, versioned ontology mapping and evidence-backed knowledge graphs"),

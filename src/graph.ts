@@ -1,4 +1,4 @@
-import { BatchCondition, g, NodeRef, Predicate, PropertyProjection, PropertyValue, readBatch, sub, type WriteBatch, writeBatch } from "@helix-db/helix-db"
+import { BatchCondition, BindingProjection, g, NodeRef, Predicate, PropertyProjection, PropertyValue, readBatch, sub, type WriteBatch, writeBatch } from "@helix-db/helix-db"
 import { randomUUID } from "node:crypto"
 import { Array as Arr, Console, Effect, Schema } from "effect"
 import { mkdir } from "node:fs/promises"
@@ -442,12 +442,24 @@ export const claims = Effect.fn("claims")(function*(generation: string, entityId
 
 const Hit = Schema.Struct({ documentId: Schema.String, title: Schema.String, kind: Schema.String, source: Schema.String })
 const hitFields = props("documentId", "title", "kind", "source")
+const boundHitFields = hitFields.map(field => BindingProjection.current(field.source, field.source))
+const TextHit = Schema.Struct({ ...Hit.fields, passage: Schema.String })
+const ClaimEvidence = Schema.fromJsonString(Schema.Array(Evidence))
+type SearchMatch = typeof Hit.Type & { passage?: string }
 type SearchFilters = { kinds: ReadonlyArray<string>; sources: ReadonlyArray<string>; documents: ReadonlyArray<string>; mode?: "hybrid" | "text" | "vector" | "graph" }
 
-const rankSources = (channels: readonly (readonly (typeof Hit.Type)[])[], top: number) => {
-  const ranked = new Map<string, typeof Hit.Type & { score: number }>()
-  for (const channel of channels) for (const [rank, hit] of channel.entries()) {
-    ranked.set(hit.documentId, { ...hit, score: (ranked.get(hit.documentId)?.score ?? 0) + 1 / (60 + rank + 1) })
+const rankSources = (channels: readonly (readonly SearchMatch[])[], top: number) => {
+  const ranked = new Map<string, typeof Hit.Type & { score: number; passage: string | null; entities: string[] }>()
+  for (const channel of channels) {
+    const seen = new Set<string>()
+    for (const hit of channel) {
+      if (seen.has(hit.documentId)) continue
+      const previous = ranked.get(hit.documentId)
+      ranked.set(hit.documentId, { ...hit, score: (previous?.score ?? 0) + 1 / (61 + seen.size),
+        passage: previous?.passage ?? hit.passage ?? null, entities: [] })
+      seen.add(hit.documentId)
+      if (seen.size === top) break
+    }
   }
   return [...ranked.values()].sort((a, b) => b.score - a.score).slice(0, top)
 }
@@ -527,23 +539,36 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
     ...(filters.documents.length ? [Predicate.isIn("documentId", [...filters.documents])] : []),
   ])
   const sources = g().nWithLabelWhere("KnowledgeSource", sourceFilter)
-  const fields = hitFields
-  const channels: (readonly (typeof Hit.Type)[])[] = []
+  const channels: (readonly SearchMatch[])[] = []
   if (mode === "hybrid" || mode === "text") {
-    const rows = Schema.NullOr(Schema.Array(Hit))
     const content = g().nWithLabelWhere("KnowledgeText", sourceFilter).textSearch("KnowledgeText", "content", query, top * 4, scope)
     const result = yield* helix.read("search_text", readBatch()
-      .varAs("content", content.out("TEXT_OF").dedup().limit(top).project(fields))
-      .varAs("title", sources.textSearch("KnowledgeSource", "title", query, top, scope).project(fields))
-      .returning(["content", "title"]), Schema.Struct({ content: rows, title: rows }))
+      .varAs("content", content.bind("segment").out("TEXT_OF").projectBindings([
+        ...boundHitFields, BindingProjection.binding("segment", "content", "passage"),
+      ]))
+      .varAs("title", sources.textSearch("KnowledgeSource", "title", query, top, scope).project(hitFields))
+      .returning(["content", "title"]), Schema.Struct({ content: Schema.NullOr(Schema.Array(TextHit)), title: Schema.NullOr(Schema.Array(Hit)) }))
     channels.push(result.content ?? [], result.title ?? [])
   }
   if (mode === "hybrid" || mode === "graph") {
     const named = yield* entities(generation, query)
     if (named.length) {
       const related = occurrences(named).where(sourceFilter).dedup().limit(top)
-      const result = yield* helix.read("search_graph", readBatch().varAs("rows", related.project(fields)).returning(["rows"]), Rows(Hit))
-      channels.push(result.rows ?? [])
+      const ids = named.map(entity => entity.entityId)
+      const claimFilter = Predicate.or([Predicate.isIn("subject", ids), Predicate.isIn("object", ids)])
+      const result = yield* helix.read("search_graph", readBatch()
+        .varAs("related", related)
+        .varAs("rows", g().n(NodeRef.var("related")).project(hitFields))
+        .varAs("claims", g().n(NodeRef.var("related")).in("EVIDENCE").hasLabel("KnowledgeClaim").where(claimFilter)
+          .project(props("documentId", "evidence")))
+        .returning(["rows", "claims"]), Schema.Struct({
+        rows: Schema.NullOr(Schema.Array(Hit)),
+        claims: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String, evidence: ClaimEvidence }))),
+      }))
+      const claims = Map.groupBy(result.claims ?? [], claim => claim.documentId)
+      channels.push((result.rows ?? []).map(hit => ({
+        ...hit, passage: claims.get(hit.documentId)?.[0]?.evidence[0]?.quote,
+      })))
     }
   }
   if (mode === "hybrid" || mode === "vector") {
@@ -556,16 +581,37 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
       for (let k = Math.min(top, metadata.claims); ; k = Math.min(k * 2, metadata.claims)) {
         const result = yield* helix.read("search_vector", readBatch().varAs("rows", candidates
           .vectorSearchWith("KnowledgeClaim", "embedding", PropertyValue.f32Array([...vectors[0]]), k, scope)
-          .out("EVIDENCE").hasLabel("KnowledgeSource").where(sourceFilter).dedup().limit(top).project(fields))
-          .returning(["rows"]), Rows(Hit))
+          .bind("claim").out("EVIDENCE").hasLabel("KnowledgeSource").where(sourceFilter).projectBindings([
+            ...boundHitFields, BindingProjection.binding("claim", "evidence", "evidence"),
+          ]))
+          .returning(["rows"]), Rows(Schema.Struct({ ...Hit.fields, evidence: ClaimEvidence })))
         const hits = result.rows ?? []
-        if (hits.length >= top || k === metadata.claims) {
-          channels.push(hits)
+        if (new Set(hits.map(hit => hit.documentId)).size >= top || k === metadata.claims) {
+          channels.push(hits.map(({ evidence, ...hit }) => ({ ...hit, passage: evidence[0]?.quote })))
           break
         }
       }
     } else if (mode === "vector") return yield* Effect.fail(new Error("Vector retrieval requires claim embeddings in this generation and OPENAI_API_KEY"))
     else yield* Console.error("Vector channel unavailable; using text and graph retrieval.")
   }
-  return rankSources(channels, top)
+  const hits = rankSources(channels, top)
+  if (!hits.length) return hits
+  const matchedSources = g().nWithLabelWhere("KnowledgeSource", Predicate.isIn("key", hits.map(hit => `${scope}:${hit.documentId}`)))
+  const openingKeys = hits.filter(hit => hit.passage === null).map(hit => `${scope}:${hit.documentId}:0`)
+  const result = yield* helix.read("search_hit_details", readBatch()
+    .varAs("entities", matchedSources.bind("document").in("OCCURS_IN").hasLabel("KnowledgeEntity").projectBindings([
+      BindingProjection.binding("document", "documentId", "documentId"),
+      BindingProjection.current("name", "name"),
+    ]))
+    .varAs("openings", g().nWithLabelWhere("KnowledgeText", Predicate.isIn("key", openingKeys)).project(props("documentId", "content")))
+    .returning(["entities", "openings"]), Schema.Struct({
+    entities: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String, name: Schema.String }))),
+    openings: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String, content: Schema.String }))),
+  }))
+  const entitiesByDocument = Map.groupBy(result.entities ?? [], row => row.documentId)
+  const openings = new Map((result.openings ?? []).map(row => [row.documentId, row.content]))
+  return hits.map(hit => ({
+    ...hit, passage: hit.passage ?? openings.get(hit.documentId) ?? null,
+    entities: [...new Set(entitiesByDocument.get(hit.documentId)?.map(row => row.name))].sort(),
+  }))
 })
