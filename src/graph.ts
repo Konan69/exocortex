@@ -238,7 +238,7 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
     ? yield* checked(() => project(records, ontology, resolutionVerdicts)) : mappingProjection
   if (new Set(resolutionVerdicts.map(verdict => verdict.id)).size !== resolutionVerdicts.length || resolutionVerdicts.some(verdict => !projected.evaluated.has(verdict.id))) return yield* Effect.fail(new Error("Resolution review contains duplicate or unknown candidates"))
   resolutionVerdicts = [...resolutionVerdicts].sort((a, b) => a.id.localeCompare(b.id))
-  const fingerprint = digest(canonicalJSON([reviewFingerprint, embeddingModel, resolutionVerdicts, "occurrences-v1"]))
+  const fingerprint = digest(canonicalJSON([reviewFingerprint, embeddingModel, resolutionVerdicts, "occurrences-v1", "text-segments-v1"]))
   const id = randomUUID()
   const scope = `${tenant()}:${id}`
   const helix = yield* Helix
@@ -283,11 +283,28 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
   const supported = new Set(mappingVerdicts.filter(verdict => verdict.verdict === "supported").map(verdict => verdict.claimId))
   const acceptedClaims = projected.claims.filter(claim => supported.has(claim.id))
   for (const record of records) {
+    const { id: documentId, title, content, kind, source, url } = record.source
+    const key = `${scope}:${documentId}`
     yield* helix.write("source", writeBatch().varAs("source", g().addN("KnowledgeSource", {
-      key: `${scope}:${record.source.id}`, scope, tenant_id: tenant(), documentId: record.source.id,
-      title: record.source.title, content: record.source.content, kind: record.source.kind, source: record.source.source, url: record.source.url,
+      key, scope, tenant_id: tenant(), documentId, title, kind, source, url,
       sourceHash: record.sourceHash, payload: JSON.stringify(record),
     })).returning([]))
+    for (let start = 0, index = 0; start < content.length; index++) {
+      let end = Math.min(start + 150_000, content.length)
+      if (end < content.length) {
+        const paragraph = content.lastIndexOf("\n\n", end - 2)
+        if (paragraph >= start) end = paragraph + 2
+        else if ((content.codePointAt(end - 1) ?? 0) > 0xffff) end--
+      }
+      yield* helix.write("source_text", writeBatch()
+        .varAs("source", keyed("KnowledgeSource", key))
+        .varAs("text", g().addN("KnowledgeText", {
+          key: `${key}:${index}`, scope, tenant_id: tenant(), documentId, index, content: content.slice(start, end), kind, source,
+        }))
+        .varAs("text_edge", g().n(NodeRef.var("text")).addE("TEXT_OF", NodeRef.var("source"), { scope }))
+        .returning([]))
+      start = end
+    }
   }
   for (const entity of projected.entities.values()) {
     const key = `${scope}:${entity.id}`
@@ -495,8 +512,9 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   const channels: (readonly (typeof Hit.Type)[])[] = []
   if (mode === "hybrid" || mode === "text") {
     const rows = Schema.NullOr(Schema.Array(Hit))
+    const content = g().nWithLabelWhere("KnowledgeText", sourceFilter).textSearch("KnowledgeText", "content", query, top * 4, scope)
     const result = yield* helix.read("search_text", readBatch()
-      .varAs("content", sources.textSearch("KnowledgeSource", "content", query, top, scope).project(fields))
+      .varAs("content", content.out("TEXT_OF").dedup().limit(top).project(fields))
       .varAs("title", sources.textSearch("KnowledgeSource", "title", query, top, scope).project(fields))
       .returning(["content", "title"]), Schema.Struct({ content: rows, title: rows }))
     channels.push(result.content ?? [], result.title ?? [])

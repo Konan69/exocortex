@@ -15,11 +15,14 @@ export class HelixError extends Schema.TaggedError<HelixError>()("HelixError", {
 
 
 const INDEXES: ReadonlyArray<readonly [string, IndexSpec]> = [
-  ...["KnowledgeHead", "KnowledgeGeneration", "KnowledgeSource", "KnowledgeEntity", "KnowledgeAlias", "KnowledgeClaim"].flatMap(label => [
+  ...["KnowledgeHead", "KnowledgeGeneration", "KnowledgeSource", "KnowledgeText", "KnowledgeEntity", "KnowledgeAlias", "KnowledgeClaim"].flatMap(label => [
     [`${label}_key`, IndexSpec.nodeUniqueEquality(label, "key")] as const,
     [`${label}_scope`, IndexSpec.nodeEquality(label, "scope")] as const,
   ]),
-  ["knowledge_source_text", IndexSpec.nodeText("KnowledgeSource", "content", "scope")],
+  ["knowledge_text_content", IndexSpec.nodeText("KnowledgeText", "content", "scope")],
+  ["knowledge_text_document", IndexSpec.nodeEquality("KnowledgeText", "documentId")],
+  ["knowledge_text_kind", IndexSpec.nodeEquality("KnowledgeText", "kind")],
+  ["knowledge_text_origin", IndexSpec.nodeEquality("KnowledgeText", "source")],
   ["knowledge_source_title", IndexSpec.nodeText("KnowledgeSource", "title", "scope")],
   ["knowledge_source_document", IndexSpec.nodeEquality("KnowledgeSource", "documentId")],
   ["knowledge_source_kind", IndexSpec.nodeEquality("KnowledgeSource", "kind")],
