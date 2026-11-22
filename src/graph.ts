@@ -1,10 +1,10 @@
-import { BatchCondition, g, NodeRef, Predicate, PropertyProjection, PropertyValue, readBatch, sub, writeBatch } from "@helix-db/helix-db"
+import { BatchCondition, g, NodeRef, Predicate, PropertyProjection, PropertyValue, readBatch, sub, type WriteBatch, writeBatch } from "@helix-db/helix-db"
 import { randomUUID } from "node:crypto"
 import { Array as Arr, Console, Effect, Schema } from "effect"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 import { Settings } from "./config.ts"
-import { Helix } from "./helix.ts"
+import { Helix, type HelixError } from "./helix.ts"
 import { EMBED_BATCH, Models } from "./ai.ts"
 import { checked, io, judgeCandidates, readJSON, saveJSON } from "./extraction.ts"
 import { canonicalJSON, comparability, digest, entityKey, Evidence, ExtractedEntity, ExtractionRecord, lookupName, mapExtraction, Ontology, Source, validateRecord, Verdict } from "./knowledge.ts"
@@ -282,13 +282,28 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
   if (reviewed.size !== projected.claims.length || mappingVerdicts.length !== projected.claims.length || projected.claims.some(claim => reviewed.get(claim.id)?.documentId !== claim.documentId)) return yield* Effect.fail(new Error("Mapping review does not cover this projection"))
   const supported = new Set(mappingVerdicts.filter(verdict => verdict.verdict === "supported").map(verdict => verdict.claimId))
   const acceptedClaims = projected.claims.filter(claim => supported.has(claim.id))
-  for (const record of records) {
-    const { id: documentId, title, content, kind, source, url } = record.source
-    const key = `${scope}:${documentId}`
-    yield* helix.write("source", writeBatch().varAs("source", g().addN("KnowledgeSource", {
-      key, scope, tenant_id: tenant(), documentId, title, kind, source, url,
+  const writeRows = <Row>(query: string, rows: ReadonlyArray<Row>,
+    append: (batch: WriteBatch, row: Row, index: number) => WriteBatch, batchSize = 64,
+  ) => Effect.forEach(Arr.chunksOf(rows, batchSize), function writeChunk(chunk: ReadonlyArray<Row>): Effect.Effect<void, HelixError> {
+    const batch = chunk.reduce(append, writeBatch()).returning([])
+    // Keep a large row in its own request.
+    if (chunk.length > 1 && Buffer.byteLength(batch.toQueryJson({ queryName: query })) > 1024 * 1024) {
+      const middle = Math.ceil(chunk.length / 2)
+      return writeChunk(chunk.slice(0, middle)).pipe(Effect.andThen(writeChunk(chunk.slice(middle))))
+    }
+    return helix.writeGenerationBatch(query, batch)
+  }, { concurrency: 2, discard: true })
+
+  const tenantId = tenant()
+  yield* writeRows("source", records, (batch, record, index) => {
+    const { id: documentId, title, kind, source, url } = record.source
+    return batch.varAs(`source_${index}`, g().addN("KnowledgeSource", {
+      key: `${scope}:${documentId}`, scope, tenant_id: tenantId, documentId, title, kind, source, url,
       sourceHash: record.sourceHash, payload: JSON.stringify(record),
-    })).returning([]))
+    }))
+  })
+  const textSegments = records.flatMap(({ source: { id: documentId, content, kind, source } }) => {
+    const segments = []
     for (let start = 0, index = 0; start < content.length; index++) {
       let end = Math.min(start + 150_000, content.length)
       if (end < content.length) {
@@ -296,50 +311,54 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
         if (paragraph >= start) end = paragraph + 2
         else if ((content.codePointAt(end - 1) ?? 0) > 0xffff) end--
       }
-      yield* helix.write("source_text", writeBatch()
-        .varAs("source", keyed("KnowledgeSource", key))
-        .varAs("text", g().addN("KnowledgeText", {
-          key: `${key}:${index}`, scope, tenant_id: tenant(), documentId, index, content: content.slice(start, end), kind, source,
-        }))
-        .varAs("text_edge", g().n(NodeRef.var("text")).addE("TEXT_OF", NodeRef.var("source"), { scope }))
-        .returning([]))
+      segments.push({ key: `${scope}:${documentId}:${index}`, scope, tenant_id: tenantId, documentId, index, content: content.slice(start, end), kind, source })
       start = end
     }
-  }
-  for (const entity of projected.entities.values()) {
-    const key = `${scope}:${entity.id}`
-    let batch = writeBatch().varAs("entity", g().addN("KnowledgeEntity", {
-      key, scope, tenant_id: tenant(), entityId: entity.id, name: entity.name, type: entity.type,
-      aliases: [...entity.aliases], documents: [...entity.documents],
-    }))
-    for (const [index, document] of [...entity.documents].entries()) {
-      batch = batch
-        .varAs(`source_${index}`, keyed("KnowledgeSource", `${scope}:${document}`))
-        .varAs(`occurrence_${index}`, g().n(NodeRef.var("entity")).addE("OCCURS_IN", NodeRef.var(`source_${index}`), { scope }))
-    }
-    yield* helix.write("entity", batch.returning([]))
-    for (const alias of new Set([...entity.aliases].map(lookupName))) yield* helix.write("alias", writeBatch().varAs("alias", g().addN("KnowledgeAlias", {
-      key: `${key}:${digest(alias)}`, scope, tenant_id: tenant(), name: alias, entityId: entity.id,
-    })).returning([]))
-  }
+    return segments
+  })
+  yield* writeRows("source_text", textSegments, (batch, segment, index) => batch
+    .varAs(`source_${index}`, keyed("KnowledgeSource", `${scope}:${segment.documentId}`))
+    .varAs(`text_${index}`, g().addN("KnowledgeText", segment))
+    .varAs(`text_edge_${index}`, g().n(NodeRef.var(`text_${index}`)).addE("TEXT_OF", NodeRef.var(`source_${index}`), { scope })))
+
+  const entities = [...projected.entities.values()]
+  yield* writeRows("entity", entities, (batch, entity, index) => batch.varAs(`entity_${index}`, g().addN("KnowledgeEntity", {
+    key: `${scope}:${entity.id}`, scope, tenant_id: tenantId, entityId: entity.id, name: entity.name, type: entity.type,
+    aliases: [...entity.aliases], documents: [...entity.documents],
+  })))
+  const occurrences = entities.flatMap(entity => Array.from(entity.documents, documentId => ({ entityId: entity.id, documentId })))
+  yield* writeRows("occurrence", occurrences, (batch, { entityId, documentId }, index) => batch
+    .varAs(`entity_${index}`, keyed("KnowledgeEntity", `${scope}:${entityId}`))
+    .varAs(`source_${index}`, keyed("KnowledgeSource", `${scope}:${documentId}`))
+    .varAs(`occurrence_${index}`, g().n(NodeRef.var(`entity_${index}`)).addE("OCCURS_IN", NodeRef.var(`source_${index}`), { scope })))
+  const aliases = entities.flatMap(entity => Array.from(new Set([...entity.aliases].map(lookupName)), name => ({
+    key: `${scope}:${entity.id}:${digest(name)}`, scope, tenant_id: tenantId, name, entityId: entity.id,
+  })))
+  yield* writeRows("alias", aliases, (batch, alias, index) => batch.varAs(`alias_${index}`, g().addN("KnowledgeAlias", alias)))
+
   for (const page of Arr.chunksOf(acceptedClaims, EMBED_BATCH)) {
     const vectors = embeddingModel ? yield* models.embed(page.map(claim => claim.statement)) : []
     if (embeddingModel && (vectors.length !== page.length || vectors.some(vector => vector.length !== settings.dimensions))) return yield* Effect.fail(new Error("Embedding output does not cover all claims"))
-    for (const [index, claim] of page.entries()) {
-    let batch = writeBatch()
-      .varAs("subject", keyed("KnowledgeEntity", `${scope}:${claim.subject}`))
-      .varAs("source", keyed("KnowledgeSource", `${scope}:${claim.documentId}`))
-      .varAs("claim", g().addN("KnowledgeClaim", { key: `${scope}:${claim.id}`, scope, tenant_id: tenant(), ...claim,
+    const claims = page.map((claim, index) => ({
+      claim,
+      properties: { key: `${scope}:${claim.id}`, scope, tenant_id: tenantId, ...claim,
         ...(embeddingModel ? { embedding: PropertyValue.f32Array([...vectors[index]!]) } : {}),
-      }))
-      .varAs("subject_edge", g().n(NodeRef.var("claim")).addE("SUBJECT", NodeRef.var("subject"), { scope }))
-      .varAs("source_edge", g().n(NodeRef.var("claim")).addE("EVIDENCE", NodeRef.var("source"), { scope }))
-    if (claim.object !== null) batch = batch
-      .varAs("object", keyed("KnowledgeEntity", `${scope}:${claim.object}`))
-      .varAs("object_edge", g().n(NodeRef.var("claim")).addE("OBJECT", NodeRef.var("object"), { scope }))
-      .varAs("relationship", g().n(NodeRef.var("subject")).addE(claim.relation, NodeRef.var("object"), { scope, claimId: claim.id, documentId: claim.documentId }))
-    yield* helix.write("claim", batch.returning([]))
-    }
+      },
+    }))
+    yield* writeRows("claim", claims, (batch, { claim, properties }, index) => {
+      const subject = `subject_${index}`, source = `source_${index}`, node = `claim_${index}`, object = `object_${index}`
+      batch = batch
+        .varAs(subject, keyed("KnowledgeEntity", `${scope}:${claim.subject}`))
+        .varAs(source, keyed("KnowledgeSource", `${scope}:${claim.documentId}`))
+        .varAs(node, g().addN("KnowledgeClaim", properties))
+        .varAs(`subject_edge_${index}`, g().n(NodeRef.var(node)).addE("SUBJECT", NodeRef.var(subject), { scope }))
+        .varAs(`source_edge_${index}`, g().n(NodeRef.var(node)).addE("EVIDENCE", NodeRef.var(source), { scope }))
+      if (claim.object !== null) batch = batch
+        .varAs(object, keyed("KnowledgeEntity", `${scope}:${claim.object}`))
+        .varAs(`object_edge_${index}`, g().n(NodeRef.var(node)).addE("OBJECT", NodeRef.var(object), { scope }))
+        .varAs(`relationship_${index}`, g().n(NodeRef.var(subject)).addE(claim.relation, NodeRef.var(object), { scope, claimId: claim.id, documentId: claim.documentId }))
+      return batch
+    }, EMBED_BATCH / 2)
   }
   const generation: Generation = { id, fingerprint, corpusHash, ontology, mappingModel: settings.jevModel, mappingVersion, embeddingModel, documents: records.length, entities: projected.entities.size, claims: acceptedClaims.length,
     unmappedEntities: projected.unmappedEntities, unmappedClaims: projected.unmappedClaims + projected.claims.length - acceptedClaims.length, mappingVerdicts,

@@ -47,6 +47,7 @@ export class Helix extends Context.Service<Helix, {
   ) => Effect.Effect<S["Type"], HelixError, S["DecodingServices"]>
   /** Serialized: one write in flight. `durable: false` acknowledges before the commit reaches object storage. */
   readonly write: (query: string, batch: WriteBatch, options?: { readonly durable?: boolean }) => Effect.Effect<void, HelixError>
+  readonly writeGenerationBatch: (query: string, batch: WriteBatch) => Effect.Effect<void, HelixError>
   readonly writeReturning: <S extends Schema.Top>(
     query: string,
     batch: WriteBatch,
@@ -106,14 +107,15 @@ export class Helix extends Context.Service<Helix, {
       )
 
     const send = (query: string, batch: WriteBatch, durable: boolean) =>
-      writer.withPermits(1)(post(query, batch.toQueryJson({ queryName: query }), { "x-helix-await-durable": String(durable) }))
+      post(query, batch.toQueryJson({ queryName: query }), { "x-helix-await-durable": String(durable) })
 
     const read = <S extends Schema.Top>(query: string, batch: ReadBatch, schema: S) =>
       post(query, batch.toQueryJson({ queryName: query }), {}).pipe(Effect.flatMap(decode(query, schema)))
     const write = (query: string, batch: WriteBatch, options?: { readonly durable?: boolean }) =>
-      Effect.asVoid(send(query, batch, options?.durable ?? true))
+      writer.withPermits(1)(Effect.asVoid(send(query, batch, options?.durable ?? true)))
+    const writeGenerationBatch = (query: string, batch: WriteBatch) => Effect.asVoid(send(query, batch, true))
     const writeReturning = <S extends Schema.Top>(query: string, batch: WriteBatch, schema: S) =>
-      send(query, batch, true).pipe(Effect.flatMap(decode(query, schema)))
+      writer.withPermits(1)(send(query, batch, true)).pipe(Effect.flatMap(decode(query, schema)))
 
     const createIndexes = INDEXES.reduce(
       (batch, [name, spec]) => batch.varAs(name, g().createIndexIfNotExists(spec)),
@@ -145,6 +147,7 @@ export class Helix extends Context.Service<Helix, {
     return Helix.of({
       read,
       write,
+      writeGenerationBatch,
       writeReturning,
       raw,
       ensureIndexes: yield* Effect.cached(ensureIndexes),
