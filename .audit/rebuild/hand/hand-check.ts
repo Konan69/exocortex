@@ -9,6 +9,13 @@ import { Schema } from "effect"
 const root = import.meta.dir
 const prepared: { documents: { id: string; path: string; sourceHash: string }[] } = await Bun.file(join(root, "../prepared-input.json")).json()
 const byId = new Map(prepared.documents.map(row => [row.id, row]))
+const titleRows = (await Bun.file(join(root, "titles.tsv")).text()).trimEnd().split("\n")
+if (titleRows.shift() !== "documentId\ttitle") throw new Error("Invalid title snapshot header")
+const legacyTitles = new Map(titleRows.map(line => {
+  const [id, title] = line.split("\t")
+  if (!id || !title) throw new Error("Invalid title snapshot row")
+  return [id, Schema.decodeUnknownSync(Schema.String)(JSON.parse(title))]
+}))
 
 const Hand = Schema.Struct({
   id: Schema.String,
@@ -41,6 +48,8 @@ const OriginalSource = Schema.Struct({
 
 async function preparedSource(location: typeof prepared.documents[number]): Promise<Source> {
   const source = Schema.decodeUnknownSync(Source)(await Bun.file(location.path).json())
+  const legacyTitle = legacyTitles.get(source.id)
+  if (legacyTitle !== undefined) return { ...source, title: legacyTitle }
   if (source.title.trim() && source.title !== source.id) return source
   if (source.provenance.kind !== "original" || !source.provenance.path.endsWith(".json")) return source
   const file = Bun.file(source.provenance.path)
