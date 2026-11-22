@@ -73,7 +73,9 @@ export const generationRecords = Effect.fn("generationRecords")(function*(genera
 export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Ontology, verdicts: ReadonlyArray<ResolutionVerdict> = []) {
   const entities = new Map<string, { id: string; name: string; type: string; aliases: Set<string>; documents: Set<string> }>()
   const claims: { id: string; documentId: string; subject: string; object: string | null; value: string | null; relation: string; statement: string; evidence: string; qualifiers: string }[] = []
-  const names = new Map<string, ResolutionObservation[]>()
+  const representatives = new Map<string, ResolutionObservation[]>()
+  const decisions = new Map(verdicts.map(verdict => [verdict.id, verdict.verdict]))
+  const evaluated = new Map<string, ResolutionCandidate>()
   const candidates = new Map<string, ResolutionCandidate>()
   let unmappedEntities = 0, unmappedClaims = 0
   for (const record of [...records].sort((a, b) => a.source.id.localeCompare(b.source.id))) {
@@ -97,13 +99,24 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
       }
       for (const name of new Set([raw.name, ...raw.aliases].map(lookupName))) {
         const bucket = canonicalJSON([type.name, name])
-        // Pair each observation with the bucket's first one only: n-1 reviews per name, not n².
-        const anchor = names.get(bucket)?.[0]
-        if (!anchor) { names.set(bucket, [observation]); continue }
-        if (anchor.key === id || anchor.source.id === record.source.id) continue
-        const [left, right] = anchor.key < id ? [anchor, observation] : [observation, anchor]
-        const candidateId = digest(canonicalJSON([type, left.key, right.key]))
-        if (!candidates.has(candidateId)) candidates.set(candidateId, { id: candidateId, type, left, right })
+        const clusters = representatives.get(bucket) ?? []
+        let joined = false
+        for (const representative of clusters) {
+          if (representative.key === id || representative.source.id === record.source.id) continue
+          const [left, right] = representative.key < id ? [representative, observation] : [observation, representative]
+          const candidateId = digest(canonicalJSON([type.name, left.key, right.key]))
+          const candidate = evaluated.get(candidateId) ?? { id: candidateId, type, left, right }
+          evaluated.set(candidateId, candidate)
+          const decision = decisions.get(candidateId)
+          if (decision === "refuted" || decision === "uncertain") continue
+          if (decision === "supported") joined = true
+          else candidates.set(candidateId, candidate)
+          break
+        }
+        if (!joined) {
+          clusters.push(observation)
+          representatives.set(bucket, clusters)
+        }
       }
     }
     for (const mapped of mapping.claims) {
@@ -116,11 +129,9 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
       })
     }
   }
-  const supported = new Set(verdicts.filter(verdict => verdict.verdict === "supported").map(verdict => verdict.id))
-  const refuted = new Set(verdicts.filter(verdict => verdict.verdict === "refuted").map(verdict => verdict.id))
   const held = new Map<string, Set<string>>()
-  for (const { id, left, right } of candidates.values()) {
-    if (!refuted.has(id)) continue
+  for (const { id, left, right } of evaluated.values()) {
+    if (decisions.get(id) !== "refuted") continue
     for (const [key, peer] of [[left.key, right.key], [right.key, left.key]] as const) {
       const peers = held.get(key) ?? new Set<string>()
       peers.add(peer)
@@ -130,8 +141,8 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
   const canonical = new Map<string, string>()
   const groups = new Map<string, string[]>()
   let accepted = 0
-  for (const { id, left, right } of candidates.values()) {
-    if (!supported.has(id)) continue
+  for (const { id, left, right } of evaluated.values()) {
+    if (decisions.get(id) !== "supported") continue
     const a = canonical.get(left.key) ?? left.key
     const b = canonical.get(right.key) ?? right.key
     const [keep, drop] = a < b ? [a, b] : [b, a]
@@ -153,8 +164,8 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
     claim.subject = canonical.get(claim.subject) ?? claim.subject
     if (claim.object !== null) claim.object = canonical.get(claim.object) ?? claim.object
   }
-  const resolution = { proposed: candidates.size, accepted, held: candidates.size - accepted }
-  return { entities, claims, unmappedEntities, unmappedClaims, candidates, resolution }
+  const resolution = { proposed: evaluated.size, accepted, held: evaluated.size - accepted }
+  return { entities, claims, unmappedEntities, unmappedClaims, candidates, evaluated, resolution }
 }
 
 export const build = Effect.fn("build")(function*(records: ReadonlyArray<ExtractionRecord>, ontology: Ontology) {
@@ -194,13 +205,13 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
     yield* io(() => mkdir(resolutionDir, { recursive: true }))
     yield* saveJSON(resolutionFile, resolutionVerdicts)
   }
-  if (new Set(resolutionVerdicts.map(verdict => verdict.id)).size !== resolutionVerdicts.length || resolutionVerdicts.some(verdict => !mappingProjection.candidates.has(verdict.id))) return yield* Effect.fail(new Error("Resolution review contains duplicate or unknown candidates"))
+  const projected = resolutionVerdicts.length
+    ? yield* checked(() => project(records, ontology, resolutionVerdicts)) : mappingProjection
+  if (new Set(resolutionVerdicts.map(verdict => verdict.id)).size !== resolutionVerdicts.length || resolutionVerdicts.some(verdict => !projected.evaluated.has(verdict.id))) return yield* Effect.fail(new Error("Resolution review contains duplicate or unknown candidates"))
   resolutionVerdicts = [...resolutionVerdicts].sort((a, b) => a.id.localeCompare(b.id))
-  const fingerprint = digest(canonicalJSON([reviewFingerprint, embeddingModel, resolutionVerdicts]))
+  const fingerprint = digest(canonicalJSON([reviewFingerprint, embeddingModel, resolutionVerdicts, "occurrences-v1"]))
   const id = randomUUID()
   const scope = `${tenant()}:${id}`
-  const projected = resolutionVerdicts.some(verdict => verdict.verdict === "supported")
-    ? yield* checked(() => project(records, ontology, resolutionVerdicts)) : mappingProjection
   const helix = yield* Helix
   yield* helix.ensureIndexes
   const existing = yield* helix.read("generation_exists", readBatch().varAs("rows", g().nWithLabelWhere("KnowledgeGeneration", Predicate.eq("fingerprint", fingerprint)).where(Predicate.eq("tenant_id", tenant())).limit(1).project(props("payload"))).returning(["rows"]), Rows(Payload))
@@ -251,10 +262,16 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Extract
   }
   for (const entity of projected.entities.values()) {
     const key = `${scope}:${entity.id}`
-    yield* helix.write("entity", writeBatch().varAs("entity", g().addN("KnowledgeEntity", {
+    let batch = writeBatch().varAs("entity", g().addN("KnowledgeEntity", {
       key, scope, tenant_id: tenant(), entityId: entity.id, name: entity.name, type: entity.type,
       aliases: [...entity.aliases], documents: [...entity.documents],
-    })).returning([]))
+    }))
+    for (const [index, document] of [...entity.documents].entries()) {
+      batch = batch
+        .varAs(`source_${index}`, keyed("KnowledgeSource", `${scope}:${document}`))
+        .varAs(`occurrence_${index}`, g().n(NodeRef.var("entity")).addE("OCCURS_IN", NodeRef.var(`source_${index}`), { scope }))
+    }
+    yield* helix.write("entity", batch.returning([]))
     for (const alias of new Set([...entity.aliases].map(lookupName))) yield* helix.write("alias", writeBatch().varAs("alias", g().addN("KnowledgeAlias", {
       key: `${key}:${digest(alias)}`, scope, tenant_id: tenant(), name: alias, entityId: entity.id,
     })).returning([]))
@@ -425,12 +442,21 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   const scope = `${tenant()}:${generation}`
   const mode = filters.mode ?? "hybrid"
   const metadata = yield* loadGeneration(generation)
-  const resolved = entity ? yield* entities(generation, entity) : []
-  const allowed = [...new Set(resolved.flatMap(match => match.documents))]
-  if (entity && !allowed.length) return []
+  const occurrences = (matches: ReadonlyArray<typeof EntityView.Type>) =>
+    g().nWithLabelWhere("KnowledgeEntity", Predicate.isIn("key", matches.map(match => `${scope}:${match.entityId}`)))
+      .out("OCCURS_IN").hasLabel("KnowledgeSource")
+  let allowed: string[] | undefined
+  if (entity) {
+    const resolved = yield* entities(generation, entity)
+    if (!resolved.length) return []
+    const documents = occurrences(resolved).where(Predicate.eq("scope", scope)).dedup().project(props("documentId"))
+    const result = yield* helix.read("search_entity_sources", readBatch().varAs("rows", documents).returning(["rows"]), Rows(Schema.Struct({ documentId: Schema.String })))
+    allowed = (result.rows ?? []).map(row => row.documentId)
+    if (!allowed.length) return []
+  }
   const sourceFilter = Predicate.and([
     Predicate.eq("scope", scope),
-    ...(entity ? [Predicate.isIn("documentId", allowed)] : []),
+    ...(allowed ? [Predicate.isIn("documentId", allowed)] : []),
     ...(filters.kinds.length ? [Predicate.isIn("kind", [...filters.kinds])] : []),
     ...(filters.sources.length ? [Predicate.isIn("source", [...filters.sources])] : []),
     ...(filters.documents.length ? [Predicate.isIn("documentId", [...filters.documents])] : []),
@@ -449,9 +475,7 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   if (mode === "hybrid" || mode === "graph") {
     const named = yield* entities(generation, query)
     if (named.length) {
-      const related = g().nWithLabelWhere("KnowledgeEntity", Predicate.isIn("key", named.map(match => `${scope}:${match.entityId}`)))
-        .union([sub().in("SUBJECT"), sub().in("OBJECT")]).out("EVIDENCE").hasLabel("KnowledgeSource")
-        .where(sourceFilter).dedup().limit(top)
+      const related = occurrences(named).where(sourceFilter).dedup().limit(top)
       const result = yield* helix.read("search_graph", readBatch().varAs("rows", related.project(fields)).returning(["rows"]), Rows(Hit))
       channels.push(result.rows ?? [])
     }
