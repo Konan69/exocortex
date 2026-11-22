@@ -18,7 +18,7 @@ const props = (...names: string[]) => names.map(name => PropertyProjection.new(n
 const Payload = Schema.Struct({ payload: Schema.String })
 const Rows = <S extends Schema.Top>(schema: S) => Schema.Struct({ rows: Schema.NullOr(Schema.Array(schema)) })
 const keyed = (label: string, key: string) => g().nWithLabelWhere(label, Predicate.eq("key", key))
-const corpusHashOf = (records: ReadonlyArray<ExtractionRecord>) => digest(canonicalJSON(records.map(record => [record.source.id, digest(canonicalJSON(record))]).sort((a, b) => a[0]!.localeCompare(b[0]!))))
+export const corpusHashOf = (records: ReadonlyArray<ExtractionRecord>) => digest(canonicalJSON(records.map(record => [record.source.id, digest(canonicalJSON(record))]).sort((a, b) => a[0]!.localeCompare(b[0]!))))
 
 type ResolutionObservation = {
   key: string
@@ -143,7 +143,8 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
   const canonical = new Map<string, string>()
   const groups = new Map<string, string[]>()
   let accepted = 0
-  for (const { id, left, right } of evaluated.values()) {
+  // Stable order, so a newly mapped observation cannot change which conflicting judgment wins.
+  for (const { id, left, right } of [...evaluated.values()].sort((x, y) => x.id.localeCompare(y.id))) {
     if (decisions.get(id) !== "supported") continue
     const a = canonical.get(left.key) ?? left.key
     const b = canonical.get(right.key) ?? right.key
@@ -171,7 +172,8 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
         cluster.push(observation)
         continue
       }
-      for (const members of clusters.values()) {
+      for (const [clusterKey, members] of clusters) {
+        if ((groups.get(clusterKey) ?? [clusterKey]).some(member => held.get(observation.key)?.has(member))) continue
         const representative = members.find(member => member.source.id !== observation.source.id)
         if (!representative) continue
         const proposed = pair(type, representative, observation)
