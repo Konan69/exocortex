@@ -33,11 +33,29 @@ const Checks = Schema.Struct({
 
 export const fileOf = (id: string) => id.replace(/[^A-Za-z0-9._-]/g, "_") + ".json"
 
+const OriginalSource = Schema.Struct({
+  content: Schema.String,
+  title: Schema.optional(Schema.NullOr(Schema.String)),
+  metadata: Schema.optional(Schema.NullOr(Schema.Struct({ title: Schema.optional(Schema.NullOr(Schema.String)) }))),
+})
+
+async function preparedSource(location: typeof prepared.documents[number]): Promise<Source> {
+  const source = Schema.decodeUnknownSync(Source)(await Bun.file(location.path).json())
+  if (source.title.trim() && source.title !== source.id) return source
+  if (source.provenance.kind !== "original" || !source.provenance.path.endsWith(".json")) return source
+  const file = Bun.file(source.provenance.path)
+  if (!(await file.exists())) return source
+  const original = Schema.decodeUnknownSync(OriginalSource)(await file.json())
+  if (digest(original.content) !== location.sourceHash) return source
+  const title = [original.title, original.metadata?.title].find(title => title?.trim() && title !== source.id)
+  return title ? { ...source, title } : source
+}
+
 async function record(path: string, requireChecks: boolean) {
   const hand = Schema.decodeUnknownSync(Hand)(await Bun.file(path).json())
   const location = byId.get(hand.id)
   if (!location) throw new Error(`${hand.id}: not in the prepared corpus`)
-  const source = Schema.decodeUnknownSync(Source)(await Bun.file(location.path).json())
+  const source = await preparedSource(location)
   const sourceHash = digest(source.content)
   if (sourceHash !== location.sourceHash || hand.sourceHash !== sourceHash) throw new Error(`${hand.id}: sourceHash differs from the prepared source`)
   const evidence: Record<string, ReturnType<typeof evidenceOf>> = {}
@@ -102,7 +120,7 @@ if (command === "check") {
       built = extracted
     } else {
       if (flag !== "--include-pending") continue
-      const source = Schema.decodeUnknownSync(Source)(await Bun.file(location.path).json())
+      const source = await preparedSource(location)
       built = pendingRecord(source)
       if (source.id !== location.id || built.sourceHash !== location.sourceHash) throw new Error(`${location.id}: prepared source differs from its manifest`)
     }

@@ -130,7 +130,7 @@ const searchCommand = Command.make("search", {
   if (!hits.length) return yield* Console.log("Nothing found.")
   for (const hit of hits) {
     yield* Console.log(`\n${hit.title} [${hit.documentId}]  Score ${hit.score.toFixed(3)}`)
-    if (hit.entities.length) yield* Console.log(`   About ${hit.entities.join(" · ")}`)
+    if (hit.entities.length) yield* Console.log(`   About ${hit.entities.slice(0, 8).join(" · ")}`)
     if (hit.passage) yield* Console.log(`   ${excerpt(hit.passage, query)}`)
   }
 }))

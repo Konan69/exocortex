@@ -698,17 +698,41 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   const result = yield* helix.read("search_hit_details", readBatch()
     .varAs("entities", matchedSources.bind("document").in("OCCURS_IN").hasLabel("KnowledgeEntity").projectBindings([
       BindingProjection.binding("document", "documentId", "documentId"),
+      BindingProjection.current("entityId", "entityId"),
       BindingProjection.current("name", "name"),
+      BindingProjection.current("aliases", "aliases"),
     ]))
+    .varAs("claims", matchedSources.in("EVIDENCE").hasLabel("KnowledgeClaim").project(props("documentId", "subject", "object")))
     .varAs("openings", g().nWithLabelWhere("KnowledgeText", Predicate.isIn("key", openingKeys)).project(props("documentId", "content")))
-    .returning(["entities", "openings"]), Schema.Struct({
-    entities: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String, name: Schema.String }))),
+    .returning(["entities", "claims", "openings"]), Schema.Struct({
+    entities: Schema.NullOr(Schema.Array(Schema.Struct({
+      documentId: Schema.String, entityId: Schema.String, name: Schema.String, aliases: Schema.Array(Schema.String),
+    }))),
+    claims: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String, subject: Schema.String, object: Schema.NullOr(Schema.String) }))),
     openings: Schema.NullOr(Schema.Array(Schema.Struct({ documentId: Schema.String, content: Schema.String }))),
   }))
   const entitiesByDocument = Map.groupBy(result.entities ?? [], row => row.documentId)
   const openings = new Map((result.openings ?? []).map(row => [row.documentId, row.content]))
-  return hits.map(hit => ({
-    ...hit, passage: hit.passage ?? openings.get(hit.documentId) ?? null,
-    entities: [...new Set(entitiesByDocument.get(hit.documentId)?.map(row => row.name))].sort(),
-  }))
+  const claimsByDocument = Map.groupBy(result.claims ?? [], row => row.documentId)
+  const phrase = (text: string) => lookupName(text).match(/[\p{L}\p{N}]+/gu)?.join(" ") ?? ""
+  const queryPhrase = phrase(query)
+  return hits.map(hit => {
+    const counts = new Map<string, number>()
+    for (const { subject, object } of claimsByDocument.get(hit.documentId) ?? []) {
+      counts.set(subject, (counts.get(subject) ?? 0) + 1)
+      if (object && object !== subject) counts.set(object, (counts.get(object) ?? 0) + 1)
+    }
+    const ranked = (entitiesByDocument.get(hit.documentId) ?? []).map(({ entityId, name, aliases }) => ({
+      name,
+      matches: Boolean(queryPhrase) && [name, ...aliases].some(alias => {
+        const words = phrase(alias)
+        return words && (` ${queryPhrase} `.includes(` ${words} `) || ` ${words} `.includes(` ${queryPhrase} `))
+      }),
+      claims: counts.get(entityId) ?? 0,
+    })).sort((a, b) => Number(b.matches) - Number(a.matches) || b.claims - a.claims || a.name.localeCompare(b.name))
+    return {
+      ...hit, passage: hit.passage ?? openings.get(hit.documentId) ?? null,
+      entities: [...new Set(ranked.map(row => row.name))],
+    }
+  })
 })
