@@ -17,6 +17,16 @@ const legacyTitles = new Map(titleRows.map(line => {
   return [id, Schema.decodeUnknownSync(Schema.String)(JSON.parse(title))]
 }))
 
+const labelRows = (await Bun.file(join(root, "labels.tsv")).text()).trimEnd().split("\n")
+if (labelRows.shift() !== "documentId\tcategory\tsalience") throw new Error("Invalid label snapshot header")
+const decodeLabels = Schema.decodeUnknownSync(Schema.Tuple([Schema.NullOr(Schema.String), Schema.NullOr(Schema.Finite)]))
+const legacyLabels = new Map(labelRows.map(line => {
+  const [id, category, salience] = line.split("\t")
+  if (!id || !category || !salience) throw new Error("Invalid label snapshot row")
+  const [label, signal] = decodeLabels([JSON.parse(category), JSON.parse(salience)])
+  return [id, { ...(label === null ? {} : { category: label }), ...(signal === null ? {} : { salience: signal }) }]
+}))
+
 const Hand = Schema.Struct({
   id: Schema.String,
   sourceHash: Schema.String,
@@ -47,7 +57,8 @@ const OriginalSource = Schema.Struct({
 })
 
 async function preparedSource(location: typeof prepared.documents[number]): Promise<Source> {
-  const source = Schema.decodeUnknownSync(Source)(await Bun.file(location.path).json())
+  const stored = Schema.decodeUnknownSync(Source)(await Bun.file(location.path).json())
+  const source = { ...stored, ...legacyLabels.get(stored.id) }
   const legacyTitle = legacyTitles.get(source.id)
   if (legacyTitle !== undefined) return { ...source, title: legacyTitle }
   if (source.title.trim() && source.title !== source.id) return source

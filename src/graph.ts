@@ -348,7 +348,7 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Generat
   if (reviewed.size !== projected.claims.length || mappingVerdicts.length !== projected.claims.length || projected.claims.some(claim => reviewed.get(claim.id)?.documentId !== claim.documentId)) return yield* Effect.fail(new Error("Mapping review does not cover this projection"))
   const supported = new Set(mappingVerdicts.filter(verdict => verdict.verdict === "supported").map(verdict => verdict.claimId))
   const acceptedClaims = projected.claims.filter(claim => supported.has(claim.id))
-  const fingerprint = digest(canonicalJSON([corpusHash, reviewFingerprint, embeddingModel, resolutionVerdicts, mappingVerdicts, retired, "source-only-v1"]))
+  const fingerprint = digest(canonicalJSON([corpusHash, reviewFingerprint, embeddingModel, resolutionVerdicts, mappingVerdicts, retired, "source-only-v2"]))
   const id = randomUUID()
   const scope = `${tenant()}:${id}`
   const helix = yield* Helix
@@ -373,16 +373,22 @@ export const build = Effect.fn("build")(function*(records: ReadonlyArray<Generat
   }, { concurrency: 2, discard: true })
 
   const tenantId = tenant()
+  const categories = new Map<string, string>()
+  for (const { source } of records) {
+    if (source.category !== undefined) categories.set(source.id, normalizeCategory(source.category))
+  }
   yield* writeRows("source", records, (batch, record, index) => {
     const { id: documentId, title, kind, source, url } = record.source
+    const category = categories.get(documentId)
     return batch.varAs(`source_${index}`, g().addN("KnowledgeSource", {
       key: `${scope}:${documentId}`, scope, tenant_id: tenantId, documentId, title, kind, source, url,
       sourceHash: record.sourceHash, payload: JSON.stringify(record),
-      ...(record.source.category === undefined ? {} : { category: record.source.category }),
+      ...(category === undefined ? {} : { category }),
       ...(record.source.salience === undefined ? {} : { salience: record.source.salience }),
     }))
   })
-  const textSegments = records.flatMap(({ source: { id: documentId, content, kind, source, category, salience } }) => {
+  const textSegments = records.flatMap(({ source: { id: documentId, content, kind, source, salience } }) => {
+    const category = categories.get(documentId)
     const segments = []
     for (let start = 0, index = 0; start < content.length; index++) {
       let end = Math.min(start + 150_000, content.length)
