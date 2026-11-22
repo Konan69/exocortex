@@ -73,7 +73,7 @@ export const generationRecords = Effect.fn("generationRecords")(function*(genera
 export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Ontology, verdicts: ReadonlyArray<ResolutionVerdict> = []) {
   const entities = new Map<string, { id: string; name: string; type: string; aliases: Set<string>; documents: Set<string> }>()
   const claims: { id: string; documentId: string; subject: string; object: string | null; value: string | null; relation: string; statement: string; evidence: string; qualifiers: string }[] = []
-  const representatives = new Map<string, ResolutionObservation[]>()
+  const buckets = new Map<string, { type: ResolutionCandidate["type"]; observations: ResolutionObservation[] }>()
   const decisions = new Map(verdicts.map(verdict => [verdict.id, verdict.verdict]))
   const evaluated = new Map<string, ResolutionCandidate>()
   const candidates = new Map<string, ResolutionCandidate>()
@@ -98,25 +98,10 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
         evidence: record.evidence[`entity:${raw.id}`]!,
       }
       for (const name of new Set([raw.name, ...raw.aliases].map(lookupName))) {
-        const bucket = canonicalJSON([type.name, name])
-        const clusters = representatives.get(bucket) ?? []
-        let joined = false
-        for (const representative of clusters) {
-          if (representative.key === id || representative.source.id === record.source.id) continue
-          const [left, right] = representative.key < id ? [representative, observation] : [observation, representative]
-          const candidateId = digest(canonicalJSON([type.name, left.key, right.key]))
-          const candidate = evaluated.get(candidateId) ?? { id: candidateId, type, left, right }
-          evaluated.set(candidateId, candidate)
-          const decision = decisions.get(candidateId)
-          if (decision === "refuted" || decision === "uncertain") continue
-          if (decision === "supported") joined = true
-          else candidates.set(candidateId, candidate)
-          break
-        }
-        if (!joined) {
-          clusters.push(observation)
-          representatives.set(bucket, clusters)
-        }
+        const key = canonicalJSON([type.name, name])
+        const bucket = buckets.get(key) ?? { type, observations: [] }
+        bucket.observations.push(observation)
+        buckets.set(key, bucket)
       }
     }
     for (const mapped of mapping.claims) {
@@ -127,6 +112,23 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
         value: raw.object.kind === "value" ? raw.object.value : null, relation: mapped.relation,
         statement: raw.statement, evidence: JSON.stringify(record.evidence[`claim:${raw.id}`]), qualifiers: JSON.stringify(raw.qualifiers),
       })
+    }
+  }
+  const pair = (type: ResolutionCandidate["type"], a: ResolutionObservation, b: ResolutionObservation): ResolutionCandidate => {
+    const [left, right] = a.key < b.key ? [a, b] : [b, a]
+    return { id: digest(canonicalJSON([type.name, left.key, right.key])), type, left, right }
+  }
+  replay: for (const { type, observations } of buckets.values()) {
+    if (evaluated.size === decisions.size) break
+    for (const [index, a] of observations.entries()) {
+      for (let next = index + 1; next < observations.length; next++) {
+        const b = observations[next]!
+        if (a.key === b.key || a.source.id === b.source.id) continue
+        const candidate = pair(type, a, b)
+        if (!decisions.has(candidate.id) || evaluated.has(candidate.id)) continue
+        evaluated.set(candidate.id, candidate)
+        if (evaluated.size === decisions.size) break replay
+      }
     }
   }
   const held = new Map<string, Set<string>>()
@@ -159,6 +161,31 @@ export function project(records: ReadonlyArray<ExtractionRecord>, ontology: Onto
     groups.delete(drop)
     entities.delete(drop)
     accepted++
+  }
+  for (const { type, observations } of buckets.values()) {
+    const clusters = new Map<string, ResolutionObservation[]>()
+    for (const observation of observations) {
+      const key = canonical.get(observation.key) ?? observation.key
+      const cluster = clusters.get(key)
+      if (cluster) {
+        cluster.push(observation)
+        continue
+      }
+      for (const members of clusters.values()) {
+        const representative = members.find(member => member.source.id !== observation.source.id)
+        if (!representative) continue
+        const proposed = pair(type, representative, observation)
+        const decision = decisions.get(proposed.id)
+        if (decision === "refuted") continue
+        if (decision === undefined) {
+          const candidate = evaluated.get(proposed.id) ?? proposed
+          evaluated.set(candidate.id, candidate)
+          candidates.set(candidate.id, candidate)
+        }
+        break
+      }
+      clusters.set(key, [observation])
+    }
   }
   for (const claim of claims) {
     claim.subject = canonical.get(claim.subject) ?? claim.subject
