@@ -48,11 +48,11 @@ This table covers main's CLI. Shared flags apply to `search`, `docs`, `entities`
 | `--kind` | Kept on `search` and `docs` | Filters by source kind. |
 | `--source` | Kept on `search` and `docs` | Filters by source origin. |
 | `--doc` | Kept on `search` and `docs` | Filters by document ID. |
-| `--category` | Dropped | The Jev export carries bookmark labels. The current `Source` schema does not store them. |
+| `--category` | Ported on `search` and `docs` | Filters by the stored source category from the Jev export. |
 | `--status` | Replaced by `stats --generation` | Status applies to a generation. |
 | `--mine` | Dropped | The rebuild has no owner-passage labels. |
 | `--with-boilerplate` | Dropped | The rebuild stores and indexes the source text. |
-| `--min-salience` | Dropped | The Jev export carries bookmark signal. The current `Source` schema does not store it. |
+| `--min-salience` | Ported on `search` and `docs` | Filters by source salience, which is Jev signal divided by three and limited to 0 through 1. |
 | `--where` | Dropped | The rebuild accepts named source filters. |
 | `--entity` | Kept on `search` | Filters by sources with supported occurrences of one resolved name or alias. Main allowed repeated flags. |
 | `--all-entities` | Dropped | The rebuild does not expose an AND filter over entities. |
@@ -68,21 +68,21 @@ This table covers main's CLI. Shared flags apply to `search`, `docs`, `entities`
 | `name --kind` | Replaced by the input directory | The caller selects source files before extraction. |
 | `name --limit` | Replaced by the input directory | The caller selects the number of source files. |
 | `name --dry-run` | Dropped | The legacy naming stage was removed. |
-| `bookmarks [jsonl]` | Pending | Needs a source-only publication design. |
-| `bookmarks --labels` | Pending | The export has Jev labels. The source schema needs fields to retain them. |
-| `bookmarks --skip` | Pending | The tombstone file excludes deleted bookmarks. Activation currently rejects any missing active ID. |
-| `bookmarks --ftdb` | Pending | The Field Theory database supplies full article text and other post data. |
-| `bookmarks --replace` | Pending | Needs a source-only publication design. |
-| `bookmarks --graph` | Pending | Article extraction and review require model access or saved artifacts. |
-| `bookmarks --redo` | Pending | Needs a decision on article revisions and saved extractions. |
-| `bookmarks --limit` | Pending | Main limits the article graph pass. |
-| `bookmarks --dry-run` | Pending | Must read the real export without writing to Helix. |
+| `bookmarks [jsonl]` | Ported | Imports new bookmarks as pending sources into the active corpus. |
+| `bookmarks --labels` | Ported | Selects the Jev JSONL file for category and salience. |
+| `bookmarks --skip` | Ported | Selects the tombstone list. The candidate records explicit retirements for active bookmarks on that list. |
+| `bookmarks --ftdb` | Ported | Reads full articles, links, and quotes from the Field Theory database. |
+| `bookmarks --replace` | Ported | Replaces changed text with a pending record. Keeps the extraction when only metadata changes. |
+| `bookmarks --graph` | Ported | Extracts pending article bookmarks. Without the model key it reports the pending count and exits successfully. |
+| `bookmarks --redo` | Replaced by `bookmarks --replace` followed by `bookmarks --graph` | Text revisions return to pending and become eligible for extraction. |
+| `bookmarks --limit` | Ported | Limits the number of pending articles selected for the graph pass. |
+| `bookmarks --dry-run` | Ported | Reports counts without writes or model calls. |
 | `backup [dir]` | Dropped | Finished generations retain records, rules, and review decisions in Helix. Main's portable export has no rebuild equivalent. |
 | `check` | Replaced by validation in `activate` | Activation verifies corpus identity, projection counts, supported claims, and source coverage before publication. |
 | `dedupe` | Dropped | Corpus selection handles duplicate documents before building. Identity review in `map` handles entities. |
 | `dedupe --yes` | Dropped | The rebuild does not delete documents in place. |
-| `forget <file>` | Dropped | The rebuild requires the next active generation to retain existing document IDs. |
-| `forget --yes` | Dropped | The removal command has no generation equivalent. |
+| `forget <file>` | Replaced by `map` with a retirement list, then `activate` | The run manifest records each retired ID and its reason. |
+| `forget --yes` | Replaced by `activate` | Publishes the candidate and retains records in prior generations. |
 | `prune` | Dropped | Mapping projects supported facts into a new generation. |
 | `prune --yes` | Dropped | The rebuild does not prune the active graph in place. |
 | `model` | Replaced by `ontology draft`, `ontology revise`, and `map` | These draft and compare rules and build supported mapped claims. |

@@ -16,6 +16,8 @@ export const Source = Schema.Struct({
   kind: Schema.String,
   source: Schema.String,
   url: Schema.String,
+  category: Schema.optional(Schema.String),
+  salience: Schema.optional(Schema.Finite),
   provenance: Schema.Union([
     Schema.Struct({ kind: Schema.Literal("original"), path: Schema.String }),
     Schema.Struct({ kind: Schema.Literal("assembled"), parts: Schema.Array(Schema.Struct({ path: Schema.String, locator: Schema.String, hash: Schema.String })) }),
@@ -78,6 +80,22 @@ export const ExtractionRecord = Schema.Struct({
   verdicts: Schema.Array(Verdict),
 })
 export type ExtractionRecord = typeof ExtractionRecord.Type
+
+const PendingRecord = Schema.Struct({
+  source: Source,
+  sourceHash: Schema.String,
+  pending: Schema.Literal(true),
+  extraction: Schema.optional(Schema.Never),
+})
+export const GenerationRecord = Schema.Union([ExtractionRecord, PendingRecord])
+export type GenerationRecord = typeof GenerationRecord.Type
+export const hasExtraction = (record: GenerationRecord): record is ExtractionRecord => record.extraction !== undefined
+export const pendingRecord = (source: Source): typeof PendingRecord.Type => ({
+  source, sourceHash: digest(source.content), pending: true,
+})
+
+export const Retirement = Schema.Struct({ documentId: Schema.String, reason: Schema.String })
+export type Retirement = typeof Retirement.Type
 
 export const Ontology = Schema.Struct({
   name: Schema.String,
