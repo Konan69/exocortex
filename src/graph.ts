@@ -547,7 +547,11 @@ const ClaimEvidence = Schema.fromJsonString(Schema.Array(Evidence))
 type SearchMatch = typeof Hit.Type & { passage?: string }
 type SearchFilters = SourceFilters & { mode?: "hybrid" | "text" | "vector" | "graph" }
 
+// Candidates per channel, as main's search: fusion must not depend on how many hits are printed.
+const poolFor = (top: number) => Math.max(60, top * 3)
+
 const rankSources = (channels: readonly (readonly SearchMatch[])[], top: number) => {
+  const pool = poolFor(top)
   const ranked = new Map<string, typeof Hit.Type & { score: number; passage: string | null; entities: string[] }>()
   for (const channel of channels) {
     const seen = new Set<string>()
@@ -557,13 +561,14 @@ const rankSources = (channels: readonly (readonly SearchMatch[])[], top: number)
       ranked.set(hit.documentId, { ...hit, score: (previous?.score ?? 0) + 1 / (61 + seen.size),
         passage: previous?.passage ?? hit.passage ?? null, entities: [] })
       seen.add(hit.documentId)
-      if (seen.size === top) break
+      if (seen.size === pool) break
     }
   }
   return [...ranked.values()].sort((a, b) => b.score - a.score).slice(0, top)
 }
 
 const searchLegacy = Effect.fn("searchLegacy")(function*(query: string, top: number, entity: string | undefined, filters: SearchFilters) {
+  const pool = poolFor(top)
   const helix = yield* Helix
   const owner = tenant()
   const scope = Predicate.eq("tenant_id", owner)
@@ -593,18 +598,18 @@ const searchLegacy = Effect.fn("searchLegacy")(function*(query: string, top: num
   const filtered = Boolean(allowed || filters.kinds.length || filters.sources.length || filters.documents.length)
   const channels: (readonly (typeof Hit.Type)[])[] = []
   if (mode === "hybrid" || mode === "text") {
-    const title = filtered ? sources.textSearch("SourceDocument", "title", query, top, owner) : g().textSearchNodes("SourceDocument", "title", query, top, owner)
-    const content = filtered ? chunks.textSearch("Chunk", "content", query, top * 4, owner) : g().textSearchNodes("Chunk", "content", query, top * 4, owner)
+    const title = filtered ? sources.textSearch("SourceDocument", "title", query, pool, owner) : g().textSearchNodes("SourceDocument", "title", query, pool, owner)
+    const content = filtered ? chunks.textSearch("Chunk", "content", query, pool * 4, owner) : g().textSearchNodes("Chunk", "content", query, pool * 4, owner)
     const rows = Schema.NullOr(Schema.Array(Hit))
     const result = yield* helix.read("legacy_text", readBatch()
-      .varAs("content", content.in("HAS_CHUNK").where(sourceFilter).dedup().limit(top).project(hitFields))
+      .varAs("content", content.in("HAS_CHUNK").where(sourceFilter).dedup().limit(pool).project(hitFields))
       .varAs("title", title.project(hitFields))
       .returning(["content", "title"]), Schema.Struct({ content: rows, title: rows }))
     channels.push(result.content ?? [], result.title ?? [])
   }
   if (mode === "hybrid" || mode === "graph") {
     const related = yield* mentionedBy(query)
-    channels.push(related.filter(hit => !allowed || allowed.includes(hit.documentId)).slice(0, top))
+    channels.push(related.filter(hit => !allowed || allowed.includes(hit.documentId)).slice(0, pool))
   }
   if (mode === "vector") return yield* Effect.fail(new Error("Vector search needs an active knowledge generation with claim embeddings. Use text or graph search on the existing corpus."))
   return rankSources(channels, top)
@@ -642,12 +647,12 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   const channels: (readonly SearchMatch[])[] = []
   const titleMatches = new Set<string>()
   if (mode === "hybrid" || mode === "text") {
-    const content = g().nWithLabelWhere("KnowledgeText", sourceFilter).textSearch("KnowledgeText", "content", query, top * 4, scope)
+    const content = g().nWithLabelWhere("KnowledgeText", sourceFilter).textSearch("KnowledgeText", "content", query, poolFor(top) * 4, scope)
     const result = yield* helix.read("search_text", readBatch()
       .varAs("content", content.bind("segment").out("TEXT_OF").projectBindings([
         ...boundHitFields, BindingProjection.binding("segment", "content", "passage"),
       ]))
-      .varAs("title", sources.textSearch("KnowledgeSource", "title", query, top, scope).project(hitFields))
+      .varAs("title", sources.textSearch("KnowledgeSource", "title", query, poolFor(top), scope).project(hitFields))
       .returning(["content", "title"]), Schema.Struct({ content: Schema.NullOr(Schema.Array(TextHit)), title: Schema.NullOr(Schema.Array(Hit)) }))
     for (const hit of result.title ?? []) titleMatches.add(hit.documentId)
     channels.push(result.content ?? [], result.title ?? [])
@@ -655,7 +660,7 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
   if (mode === "hybrid" || mode === "graph") {
     const named = yield* entities(generation, query)
     if (named.length) {
-      const related = occurrences(named).where(sourceFilter).dedup().limit(top)
+      const related = occurrences(named).where(sourceFilter).dedup().limit(poolFor(top))
       const ids = named.map(entity => entity.entityId)
       const claimFilter = Predicate.or([Predicate.isIn("subject", ids), Predicate.isIn("object", ids)])
       const result = yield* helix.read("search_graph", readBatch()
@@ -680,7 +685,7 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
       const vectors = yield* models.embed([query])
       if (vectors.length !== 1 || vectors[0]?.length !== settings.dimensions) return yield* Effect.fail(new Error("Missing query embedding"))
       const candidates = sources.in("EVIDENCE").hasLabel("KnowledgeClaim").where(Predicate.eq("scope", scope)).dedup()
-      for (let k = Math.min(top, metadata.claims); ; k = Math.min(k * 2, metadata.claims)) {
+      for (let k = Math.min(poolFor(top), metadata.claims); ; k = Math.min(k * 2, metadata.claims)) {
         const result = yield* helix.read("search_vector", readBatch().varAs("rows", candidates
           .vectorSearchWith("KnowledgeClaim", "embedding", PropertyValue.f32Array([...vectors[0]]), k, scope)
           .bind("claim").out("EVIDENCE").hasLabel("KnowledgeSource").where(sourceFilter).projectBindings([
@@ -688,7 +693,7 @@ export const search = Effect.fn("search")(function*(generation: string | undefin
           ]))
           .returning(["rows"]), Rows(Schema.Struct({ ...Hit.fields, evidence: ClaimEvidence })))
         const hits = result.rows ?? []
-        if (new Set(hits.map(hit => hit.documentId)).size >= top || k === metadata.claims) {
+        if (new Set(hits.map(hit => hit.documentId)).size >= poolFor(top) || k === metadata.claims) {
           channels.push(hits.map(({ evidence, ...hit }) => ({ ...hit, passage: evidence[0]?.quote })))
           break
         }
