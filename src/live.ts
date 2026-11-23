@@ -5,10 +5,8 @@ import { FetchHttpClient } from "effect/http"
 import { Models } from "./ai.ts"
 import { Settings } from "./config.ts"
 import { Helix } from "./helix.ts"
-import { LinkWriter } from "./pipeline.ts"
 
-export const ExoLive = LinkWriter.layer.pipe(
-  Layer.provideMerge(Layer.mergeAll(Helix.layer, Models.live)),
+export const ExoLive = Layer.mergeAll(Helix.layer, Models.live).pipe(
   Layer.provideMerge(Settings.layer),
   Layer.provideMerge(FetchHttpClient.layer),
   Layer.provideMerge(BunServices.layer),

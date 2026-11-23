@@ -1,166 +1,212 @@
-import { Console, Effect } from "effect"
+import { join } from "node:path"
+import { Console, Effect, Option } from "effect"
 import { Argument, Command, Flag } from "effect/cli"
+import { ARTICLE_TEXT_SECTION, readBookmarks } from "./bookmarks.ts"
+import { Settings } from "./config.ts"
 import { Models } from "./ai.ts"
-import { importBookmarks, graphBookmarks } from "./bookmarks.ts"
-import * as Browse from "./browse.ts"
-import * as Maintain from "./maintain.ts"
-import * as Pipeline from "./pipeline.ts"
-import type { Filters } from "./queries.ts"
-import { search } from "./search.ts"
-import * as Walk from "./walk.ts"
+import { checked, draftOntology, extractCorpus, readCorpus, readJSON, readRecords, saveJSON, sourcesIn } from "./extraction.ts"
+import * as Graph from "./graph.ts"
+import { canonicalJSON, digest, hasExtraction, Ontology, pendingRecord, validateOntology } from "./knowledge.ts"
 
-const bool = (name: string, description = "") => Flag.Boolean(name).pipe(Flag.withDescription(description), Flag.withDefault(false))
-const many = (name: string, description: string) => Flag.String(name).pipe(Flag.withDescription(description), Flag.atLeast(0))
-const yes = bool("yes", "write; without it every change is a dry run")
-const json = bool("json", "machine-readable output")
-const dryRun = bool("dry-run", "count what would run, call no model")
-const limit = Flag.Int("limit").pipe(Flag.withDescription("stop after this many"), Flag.optional)
-
-// Filters on indexed chunk properties: repeat a flag for OR, different flags AND.
-const filterFlags = {
-  kinds: many("kind", "document kind"),
-  sources: many("source", "document source"),
-  documents: many("doc", "documentId"),
-  categories: many("category", "category name"),
-  statuses: many("status", "document status (docs only)"),
-  mine: bool("mine", "only passages about the owner"),
-  withBoilerplate: bool("with-boilerplate", "include boilerplate (hidden by default)"),
-  minSalience: Flag.Finite("min-salience").pipe(Flag.withDescription("0..1"), Flag.optional),
-  where: many("where", "field=v | field!=v | field~substring | field^prefix"),
-  entities: many("entity", "chunks about this entity (repeat = ANY)"),
-  allEntities: bool("all-entities", "chunks about EVERY --entity"),
+const json = Flag.Boolean("json").pipe(Flag.withDefault(false))
+const selected = Flag.String("generation").pipe(Flag.optional)
+const directory = Argument.Directory("directory", { mustExist: true })
+const filters = {
+  kinds: Flag.String("kind").pipe(Flag.atLeast(0)), sources: Flag.String("source").pipe(Flag.atLeast(0)), documents: Flag.String("doc").pipe(Flag.atLeast(0)),
+  categories: Flag.String("category").pipe(Flag.atLeast(0)), minSalience: Flag.Finite("min-salience").pipe(Flag.optional),
 }
-const filtersOf = (input: { readonly [K in keyof Filters]: Filters[K] }): Filters => input
+const print = (value: unknown) => Console.log(JSON.stringify(value, null, 2))
+const generationOf = (id: Option.Option<string>) => Option.match(id, { onSome: Effect.succeed, onNone: () => Graph.activeGeneration })
+const recordsDir = Effect.gen(function*() {
+  const settings = yield* Settings
+  const tenant = process.env.EXO_TENANT
+  if (!tenant) return yield* Effect.fail(new Error("EXO_TENANT is required"))
+  return join(settings.root, ".exo", digest(tenant), "extractions")
+})
+
+const extractCommand = Command.make("extract", { directory }, ({ directory }) => Effect.gen(function*() {
+  const { records, directory: runDirectory } = yield* extractCorpus(yield* sourcesIn(directory), yield* recordsDir)
+  yield* print({ documents: records.length, entities: records.reduce((sum, record) => sum + record.extraction.entities.length, 0), records: runDirectory })
+})).pipe(Command.withDescription("Extract observations without ontology mapping; retain text and evidence"))
+
+const rebalanceCommand = Command.make("rebalance", { directory, ontology: Flag.File("ontology", { mustExist: true }) }, ({ directory, ontology }) => Effect.gen(function*() {
+  const definition = yield* readJSON(ontology, Ontology)
+  yield* checked(() => validateOntology(definition))
+  const { records } = yield* extractCorpus(yield* sourcesIn(directory), yield* recordsDir)
+  yield* Graph.build(records, definition)
+})).pipe(Command.withDescription("Rebuild the supplied complete corpus into an isolated generation; does not activate"))
+
+const ingestCommand = Command.make("ingest", { directory, ontology: Flag.String("ontology").pipe(Flag.optional), replace: Flag.Boolean("replace").pipe(Flag.withDefault(false)) }, input => Effect.gen(function*() {
+  const current = yield* Graph.currentGeneration()
+  const previous = current ? { generation: yield* Graph.loadGeneration(current), records: yield* Graph.generationRecords(current) } : undefined
+  const old = previous?.records ?? []
+  const sources = yield* sourcesIn(input.directory)
+  for (const source of sources) {
+    const previous = old.find(record => record.source.id === source.id)
+    if (previous && previous.sourceHash !== digest(source.content) && !input.replace) return yield* Effect.fail(new Error(`${source.id} already exists with different text; use --replace`))
+  }
+  const definition = Option.isSome(input.ontology) ? yield* readJSON(input.ontology.value, Ontology)
+    : previous?.generation.ontology
+  if (!definition) return yield* Effect.fail(new Error("The first ingest requires --ontology <file>"))
+  const { records: fresh } = yield* extractCorpus(sources, yield* recordsDir)
+  const combined = new Map(old.map(record => [record.source.id, record]))
+  fresh.forEach(record => combined.set(record.source.id, record))
+  const next = yield* Graph.build([...combined.values()], definition, { previous })
+  yield* Graph.activate(next.id, current ?? null)
+})).pipe(Command.withDescription("Extract, map and verify documents, then activate the merged corpus"))
+
+const mapCommand = Command.make("map", { directory, ontology: Flag.File("ontology", { mustExist: true }) }, ({ directory, ontology }) => Effect.gen(function*() {
+  const { records, retired } = yield* readCorpus(directory)
+  yield* Graph.build(records, yield* readJSON(ontology, Ontology), { retired })
+})).pipe(Command.withDescription("Map saved extractions into an isolated graph generation"))
+
+const draftCommand = Command.make("draft", { directory, output: Flag.String("output") }, input => Effect.gen(function*() {
+  const definition = yield* draftOntology(yield* readRecords(input.directory))
+  yield* saveJSON(input.output, definition)
+  yield* print({ path: input.output, types: definition.types.length, relations: definition.relations.length, status: "draft" })
+}))
+const reviseCommand = Command.make("revise", { ontology: Flag.File("ontology", { mustExist: true }), generation: selected }, input => Effect.gen(function*() {
+  yield* print(yield* Graph.revise(yield* generationOf(input.generation), yield* readJSON(input.ontology, Ontology)))
+})).pipe(Command.withDescription("Replay revised rules on frozen observations without extraction calls or writes"))
+const ontologyCommand = Command.make("ontology", { generation: selected }, input => Effect.gen(function*() {
+  yield* print((yield* Graph.loadGeneration(yield* generationOf(input.generation))).ontology)
+})).pipe(Command.withSubcommands([draftCommand, reviseCommand]))
+
+const activateCommand = Command.make("activate", { generation: Argument.String("generation") }, input => Effect.gen(function*() {
+  yield* Graph.activate(input.generation, (yield* Graph.currentGeneration()) ?? null)
+}))
+const statsCommand = Command.make("stats", { generation: selected, json }, input => Effect.gen(function*() {
+  const { ontology, mappingVerdicts, ...counts } = yield* Graph.loadGeneration(yield* generationOf(input.generation))
+  yield* print({ ...counts, documentsMapped: counts.documentsMapped ?? counts.documents, documentsPending: counts.documentsPending ?? 0,
+    retired: counts.retired ?? [], ontology: ontology.name, mappingHeld: mappingVerdicts.filter(verdict => verdict.verdict !== "supported").length })
+}))
+const docsCommand = Command.make("docs", { generation: selected, json, ...filters }, input => Effect.gen(function*() {
+  const records = yield* Graph.generationRecords(yield* generationOf(input.generation), {
+    ...input, minSalience: Option.getOrUndefined(input.minSalience),
+  })
+  yield* print(records.map(record => {
+    const { id, title, kind, source, provenance, category, salience } = record.source
+    return { id, title, kind, source, sourceHash: record.sourceHash, provenance, category, salience, pending: !hasExtraction(record) }
+  }))
+}))
+const showCommand = Command.make("show", { document: Argument.String("document"), generation: selected, json }, input => Effect.gen(function*() {
+  const [record] = yield* Graph.generationRecords(yield* generationOf(input.generation), { kinds: [], sources: [], documents: [input.document] })
+  if (!record) return yield* Effect.fail(new Error(`No document ${input.document}`))
+  yield* (input.json ? print(record) : Console.log(`${record.source.title}\n\n${record.source.content}`))
+}))
+const entitiesCommand = Command.make("entities", { generation: selected, match: Flag.String("match").pipe(Flag.optional), json }, input => Effect.gen(function*() {
+  yield* print(yield* Graph.entities(yield* generationOf(input.generation), Option.getOrUndefined(input.match)))
+}))
+const walkCommand = Command.make("walk", { name: Argument.String("name"), generation: selected, json }, input => Effect.gen(function*() {
+  const generation = yield* generationOf(input.generation)
+  const matches = yield* Graph.entities(generation, input.name)
+  if (!matches.length) return yield* Effect.fail(new Error(`No entity named ${input.name}`))
+  yield* print({ entities: matches, claims: yield* Graph.claims(generation, matches.map(entity => entity.entityId)) })
+})).pipe(Command.withDescription("Supported incoming and outgoing claims, with direction and source evidence"))
+const excerpt = (passage: string, query: string) => {
+  const text = passage.replace(/\s+/g, " ").trim()
+  if (text.length <= 500) return text
+  const folded = text.toLocaleLowerCase()
+  const exact = folded.indexOf(query.toLocaleLowerCase())
+  const word = query.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu)?.findLast(term => folded.includes(term))
+  const match = exact >= 0 ? exact : word ? folded.indexOf(word) : 0
+  const start = Math.max(0, match - 100)
+  return `${start ? "…" : ""}${text.slice(start, start + 500)}${start + 500 < text.length ? "…" : ""}`
+}
 
 const searchCommand = Command.make("search", {
-  query: Argument.String("query").pipe(Argument.withDescription("names, topics, questions or half-remembered posts"), Argument.variadic()),
-  ...filterFlags,
-  mode: Flag.Literals("mode", ["graph", "hybrid", "vector", "text"]).pipe(Flag.withDescription("default hybrid: graph, vector, passage and title BM25 fused by RRF"), Flag.optional),
-  k: Flag.Int("k").pipe(Flag.withDescription("candidates per channel"), Flag.optional),
-  top: Flag.Int("top").pipe(Flag.withDefault(8)),
-  page: Flag.Int("page").pipe(Flag.withDefault(1)),
-  chunks: bool("chunks", "one hit per passage, not per document"),
-  expand: Flag.Int("expand").pipe(Flag.withDescription("neighbouring passages to print around a hit"), Flag.withDefault(0)),
-  full: bool("full"),
-  rerank: bool("rerank", "Jev re-ranks: one model call per candidate"),
-  noGraph: bool("no-graph", "skip the 'about' / connected / related walk"),
-  json,
-}, (input) => search({
-  query: input.query.join(" "), filters: filtersOf(input), mode: input.mode, k: input.k, top: input.top, page: Math.max(1, input.page),
-  chunks: input.chunks, expand: input.expand, full: input.full, rerank: input.rerank, graph: !input.noGraph, json: input.json,
-})).pipe(Command.withDescription("hybrid graph search"))
-
-const walkCommand = Command.make("walk", {
-  name: Argument.String("name").pipe(Argument.withDescription("an entity: person, organisation, product, project, place or topic"), Argument.variadic()),
-  to: Flag.String("to").pipe(Flag.withDescription("print the shortest ASSOCIATED_WITH path to this entity"), Flag.optional),
-  hops: Flag.Int("hops").pipe(Flag.withDescription("how far out to walk, default 1 (with --to: the most hops to search, default 4)"), Flag.optional),
-  top: Flag.Int("top").pipe(Flag.withDescription("neighbours kept per hop"), Flag.withDefault(15)),
-  docs: Flag.Int("docs").pipe(Flag.withDescription("documents listed"), Flag.withDefault(10)),
-  json,
-}, (input) => Walk.walk({ ...input, name: input.name.join(" ") })).pipe(Command.withDescription("walk the entity graph: neighbours, hops, documents, paths"))
-
-const queryCommand = Command.make("query", {
-  cypher: Flag.String("cypher").pipe(Flag.withDescription("one Cypher statement; $tenant is bound"), Flag.optional),
-  ts: Flag.String("ts").pipe(Flag.withDescription("a readBatch()/writeBatch() expression on the project's Helix SDK; TENANT is bound"), Flag.optional),
-  file: Flag.String("file").pipe(Flag.withDescription("a native /v2/query JSON request"), Flag.optional),
-  params: many("param", "Cypher parameter name=value"),
-  explain: bool("explain", "plan the Cypher statement, run nothing"),
-  write: bool("write", "allow a statement that writes"),
-}, (input) => Walk.query(input)).pipe(Command.withDescription("any query against the live graph (see exo schema)"))
-
-const schemaCommand = Command.make("schema", {}, () => Walk.schema).pipe(Command.withDescription("labels, edges, indexes and counts, for writing queries"))
-
-const docsCommand = Command.make("docs", { ...filterFlags, limit: Flag.Int("limit").pipe(Flag.withDefault(50)), json },
-  (input) => Browse.docs({ filters: filtersOf(input), limit: input.limit, json: input.json })).pipe(Command.withDescription("list documents"))
-
-const showCommand = Command.make("show", { documentId: Argument.String("documentId") }, ({ documentId }) => Browse.show(documentId))
-  .pipe(Command.withDescription("print a document"))
-
-const entitiesCommand = Command.make("entities", {
-  ...filterFlags,
-  entityKinds: many("entity-kind", "person | organisation | product | project | place | topic"),
-  match: Flag.String("match").pipe(Flag.withDefault("")),
-  top: Flag.Int("top").pipe(Flag.withDefault(40)),
-  json,
-  indexNames: bool("index-names", "EntityName shadow parity; --yes inserts missing names"),
-  resolve: bool("resolve", "find duplicate entities, Jev decides, --yes merges"),
-  limit,
-  yes,
-}, (input) => Effect.gen(function*() {
-  if (input.indexNames) return yield* Maintain.indexEntityNames({ yes: input.yes })
-  if (input.resolve) return yield* Maintain.resolveEntities({ yes: input.yes, limit: input.limit })
-  return yield* Browse.tally({ what: "entities", filters: filtersOf(input), entityKinds: input.entityKinds, match: input.match.toLowerCase(), top: input.top, json: input.json })
-})).pipe(Command.withDescription("what a slice of the corpus is about"))
-
-const categoriesCommand = Command.make("categories", { ...filterFlags, top: Flag.Int("top").pipe(Flag.withDefault(60)), json },
-  (input) => Browse.tally({ what: "categories", filters: filtersOf(input), entityKinds: [], match: "", top: input.top, json: input.json }))
-  .pipe(Command.withDescription("how a slice of the corpus is filed"))
-
-const ingestCommand = Command.make("ingest", {
-  dir: Argument.Directory("dir", { mustExist: true }),
-  kind: Flag.String("kind").pipe(Flag.optional),
-  replace: bool("replace"),
-}, (input) => Pipeline.ingest(input)).pipe(Command.withDescription("document + chunks + links, for every *.json in dir"))
-
-const linkCommand = Command.make("link", { kinds: many("kind", "document kind"), limit, dryRun, redo: bool("redo") },
-  (input) => Pipeline.link(input)).pipe(Command.withDescription("stage 1: Helix proposes entities, Jev decides"))
-
-const nameCommand = Command.make("name", { kinds: many("kind", "document kind"), limit, dryRun },
-  (input) => Pipeline.name(input)).pipe(Command.withDescription("stage 2: GLM names what Jev flagged, Jev checks every name"))
+  query: Argument.String("query").pipe(Argument.variadic()), generation: selected, top: Flag.Int("top").pipe(Flag.withDefault(10)),
+  entity: Flag.String("entity").pipe(Flag.optional), json,
+  ...filters,
+  mode: Flag.Literals("mode", ["hybrid", "text", "vector", "graph"]).pipe(Flag.withDefault("hybrid")),
+}, input => Effect.gen(function*() {
+  if (input.top <= 0) return yield* Effect.fail(new Error("--top must be positive"))
+  const generation = Option.isSome(input.generation) ? input.generation.value : yield* Graph.currentGeneration()
+  const query = input.query.join(" ").trim()
+  const hits = yield* Graph.search(generation, query, input.top, Option.getOrUndefined(input.entity), {
+    ...input, minSalience: Option.getOrUndefined(input.minSalience),
+  })
+  if (input.json) return yield* print({ hits })
+  if (!hits.length) return yield* Console.log("Nothing found.")
+  for (const hit of hits) {
+    yield* Console.log(`\n${hit.title} [${hit.documentId}]  Score ${hit.score.toFixed(3)}`)
+    if (hit.entities.length) yield* Console.log(`   About ${hit.entities.slice(0, 8).join(" · ")}`)
+    if (hit.passage) yield* Console.log(`   ${excerpt(hit.passage, query)}`)
+  }
+}))
 
 const bookmarksCommand = Command.make("bookmarks", {
   jsonl: Argument.String("jsonl").pipe(Argument.optional),
   labels: Flag.String("labels").pipe(Flag.optional),
   skip: Flag.String("skip").pipe(Flag.optional),
   ftdb: Flag.String("ftdb").pipe(Flag.optional),
-  replace: bool("replace"),
-  graph: bool("graph", "link, name and settle article bookmarks (>200 chars)"),
-  redo: bool("redo"),
-  limit,
-  dryRun,
-}, (input) => input.graph
-  ? graphBookmarks({ jsonl: input.jsonl, skip: input.skip, ftdb: input.ftdb, limit: input.limit, dryRun: input.dryRun, redo: input.redo })
-  : importBookmarks({ jsonl: input.jsonl, labels: input.labels, skip: input.skip, ftdb: input.ftdb, replace: input.replace, dryRun: input.dryRun }),
-).pipe(Command.withDescription("one searchable chunk per X bookmark"))
-
-const backupCommand = Command.make("backup", { dir: Argument.String("dir").pipe(Argument.optional) }, ({ dir }) => Maintain.backup(dir))
-  .pipe(Command.withDescription("entities, links and judged chunk props → backup/<stamp>/*.jsonl"))
-const checkCommand = Command.make("check", {}, () => Maintain.check).pipe(Command.withDescription("live invariants (exit 1 if broken)"))
-const dedupeCommand = Command.make("dedupe", { yes }, (input) => Maintain.dedupe(input)).pipe(Command.withDescription("remove documents that are copies of another"))
-const forgetCommand = Command.make("forget", { file: Argument.File("file", { mustExist: true }), yes }, (input) => Maintain.forget(input))
-  .pipe(Command.withDescription("remove documents listed in file, one documentId per line"))
-const pruneCommand = Command.make("prune", { yes }, (input) => Maintain.prune(input))
-  .pipe(Command.withDescription("drop links that do not stand and orphan entities, from the newest backup"))
-const modelCommand = Command.make("model", { yes }, (input) => Maintain.model(input))
-  .pipe(Command.withDescription("owner profile, category parents, EXTENDS/UPDATES, entity associations"))
-
-const statsCommand = Command.make("stats", {}, () => Browse.stats).pipe(Command.withDescription("documents by kind"))
-const profileCommand = Command.make("profile", {}, () => Browse.profile).pipe(Command.withDescription("the owner profile"))
-const taxonomyCommand = Command.make("taxonomy", { seed: bool("seed", "GLM drafts the categories from the corpus (ingest needs them)"), yes },
-  (input) => Effect.gen(function*() {
-    if (input.seed) return yield* Pipeline.seedTaxonomy({ yes: input.yes })
-    return yield* Browse.taxonomy
-  })).pipe(Command.withDescription("the categories"))
-
-
-/** Prints what the model calls cost once a command that made any finishes. */
-const withUsage = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  Effect.gen(function*() {
-    const result = yield* effect
-    const usage = yield* (yield* Models).usage
-    if (usage.decisions || usage.generations || usage.embedded) {
-      yield* Console.error(`usage: ${usage.decisions} jev calls (${usage.decisionTokens} tokens, $${usage.decisionCost.toFixed(4)}) · ${usage.generations} glm calls (${usage.promptTokens}+${usage.completionTokens} tokens) · ${usage.embedded} embedded`)
+  replace: Flag.Boolean("replace").pipe(Flag.withDefault(false)),
+  graph: Flag.Boolean("graph").pipe(Flag.withDefault(false)),
+  dryRun: Flag.Boolean("dry-run").pipe(Flag.withDefault(false)),
+  limit: Flag.Int("limit").pipe(Flag.optional),
+}, input => Effect.gen(function*() {
+  if (Option.isSome(input.limit) && (input.limit.value < 1 || !input.graph)) {
+    return yield* Effect.fail(new Error("--limit requires --graph and a positive count"))
+  }
+  if (input.graph && input.replace) return yield* Effect.fail(new Error("Run bookmarks --replace before bookmarks --graph"))
+  const { rows, retired, skipped } = yield* readBookmarks(input)
+  const current = yield* Graph.currentGeneration()
+  const canExtract = Boolean(process.env.OPENROUTER_API_KEY?.trim())
+  const onlyBookmarks = input.dryRun || (input.graph && !canExtract)
+  const records = current ? yield* Graph.generationRecords(current, onlyBookmarks ? { kinds: ["x_bookmark"], sources: [], documents: [] } : undefined) : []
+  const combined = new Map(records.map(record => [record.source.id, record]))
+  if (input.graph) {
+    const pending = records.filter(record => !hasExtraction(record) && rows.get(record.source.id)?.article)
+    const selected = Option.isSome(input.limit) ? pending.slice(0, input.limit.value) : pending
+    if (!current || input.dryRun || !selected.length || !canExtract) {
+      yield* print({ pending: pending.length, selected: selected.length, extracted: 0 })
+      return
     }
-    return result
+    const generation = yield* Graph.loadGeneration(current)
+    const { records: extracted } = yield* extractCorpus(selected.map(record => record.source), yield* recordsDir)
+    for (const record of extracted) combined.set(record.source.id, record)
+    const next = yield* Graph.build([...combined.values()], generation.ontology, { previous: { generation, records } })
+    yield* Graph.activate(next.id, generation.id)
+    return
+  }
+
+  let added = 0, replaced = 0, updatedMetadata = 0
+  for (const { source, enriched, hasArticleText } of rows.values()) {
+    const old = combined.get(source.id)
+    const canReplace = input.replace && enriched && (hasArticleText || !old?.source.content.includes(ARTICLE_TEXT_SECTION))
+    if (!old || (canReplace && old.source.content !== source.content)) {
+      combined.set(source.id, pendingRecord(source))
+      if (old) replaced++
+      else added++
+      continue
+    }
+    const updated = {
+      ...old.source,
+      ...(input.replace ? { title: source.title, url: source.url } : {}),
+      ...(source.category !== undefined && (input.replace || old.source.category === undefined) ? { category: source.category } : {}),
+      ...(source.salience !== undefined && (input.replace || old.source.salience === undefined) ? { salience: source.salience } : {}),
+    }
+    if (canonicalJSON(updated) === canonicalJSON(old.source)) continue
+    combined.set(source.id, { ...old, source: updated })
+    updatedMetadata++
+  }
+  const retirements = records.filter(record => record.source.kind === "x_bookmark" && retired.has(record.source.id))
+    .map(record => ({ documentId: record.source.id, reason: "tombstoned bookmark" }))
+  for (const { documentId } of retirements) combined.delete(documentId)
+  yield* print({ bookmarks: rows.size, skipped, added, replaced, updatedMetadata, retired: retirements.length, dryRun: input.dryRun })
+  if (input.dryRun || !(added || replaced || updatedMetadata || retirements.length)) return
+  if (!current) return yield* Effect.fail(new Error("Activate a corpus generation before importing bookmarks"))
+  const generation = yield* Graph.loadGeneration(current)
+  const next = yield* Graph.build([...combined.values()], generation.ontology, {
+    previous: { generation, records }, retired: retirements,
   })
+  yield* Graph.activate(next.id, current)
+})).pipe(Command.withDescription("Import X bookmarks and extract pending article bookmarks"))
 
-export const exo = Command.make("exo").pipe(
-  Command.withDescription("Exocortex: a headless knowledge graph on Helix — hybrid graph RAG over documents, notes and bookmarks"),
-  Command.withSubcommands([
-    searchCommand, walkCommand, queryCommand, schemaCommand, docsCommand, showCommand, entitiesCommand, categoriesCommand, statsCommand, profileCommand, taxonomyCommand,
-    ingestCommand, linkCommand, nameCommand, bookmarksCommand,
-    backupCommand, checkCommand, pruneCommand, dedupeCommand, forgetCommand, modelCommand,
-  ]),
-)
-
-export const run = (argv: ReadonlyArray<string>) => withUsage(Command.runWith(exo, { version: "2.0.0" })(argv))
+export const exo = Command.make("exo").pipe(Command.withDescription("Source observations, versioned ontology mapping and evidence-backed knowledge graphs"),
+  Command.withSubcommands([extractCommand, mapCommand, rebalanceCommand, ingestCommand, ontologyCommand, activateCommand, statsCommand, docsCommand, showCommand, entitiesCommand, walkCommand, searchCommand, bookmarksCommand]))
+export const run = (argv: ReadonlyArray<string>) => Effect.gen(function*() {
+  yield* Command.runWith(exo, { version: "3.0.0" })(argv)
+  const usage = yield* (yield* Models).usage
+  if (usage.generations || usage.decisions || usage.embedded) yield* Console.error(JSON.stringify({ usage }))
+})

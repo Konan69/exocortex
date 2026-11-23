@@ -19,7 +19,7 @@ const Gold = Schema.Struct({
   relevant: Schema.Record(Schema.String, Schema.Number),
 })
 type Gold = typeof Gold.Type
-const Output = Schema.fromJsonString(Schema.Struct({ hits: Schema.Array(Schema.Struct({ hit: Schema.Struct({ documentId: Schema.String }) })) }))
+const Output = Schema.fromJsonString(Schema.Struct({ hits: Schema.Array(Schema.Struct({ documentId: Schema.String })) }))
 const Run = Schema.Struct({
   label: Schema.String,
   at: Schema.String,
@@ -64,11 +64,11 @@ const program = Effect.gen(function*() {
 
   const runOne = Effect.fnUntraced(function*(gold: Gold) {
     const started = yield* Clock.currentTimeMillis
-    const result = yield* spawner.string(ChildProcess.make("bun", [join(ROOT, "exo.ts"), "search", gold.query, ...gold.flags, ...extra, "--json", "--top", String(K), "--no-graph"], { cwd: ROOT }))
+    const result = yield* spawner.string(ChildProcess.make("bun", [join(ROOT, "exo.ts"), "search", gold.query, ...gold.flags, ...extra, "--json", "--top", String(K)], { cwd: ROOT }))
       .pipe(Effect.flatMap(Schema.decodeUnknownEffect(Output)), Effect.result)
     const ms = (yield* Clock.currentTimeMillis) - started
     if (result._tag === "Failure") return { id: gold.id, type: gold.type, ndcg: 0, recall: 0, rr: 0, ms, ranked: [], error: String(result.failure).slice(0, 200) }
-    const ranked = result.success.hits.map((entry) => entry.hit.documentId)
+    const ranked = result.success.hits.map((entry) => entry.documentId)
     return { id: gold.id, type: gold.type, ...score(gold, ranked), ms, ranked, error: null }
   })
   const queries = yield* Effect.forEach(scored, runOne, { concurrency: 4 })
@@ -96,7 +96,7 @@ const program = Effect.gen(function*() {
   const hits = Num.sumAll(queries.map((row) => row.ranked.length))
   yield* Console.log(`\n${label}: nDCG@${K} ${mean(queries.map((row) => row.ndcg)).toFixed(3)} · recall@${K} ${mean(queries.map((row) => row.recall)).toFixed(3)} · MRR ${mean(queries.map((row) => row.rr)).toFixed(3)}`
     + `${baseline ? ` (baseline ${baseline.label}: nDCG ${mean(baseline.queries.map((row) => row.ndcg)).toFixed(3)})` : ""}`)
-  yield* Console.log(`vector channel: ${process.env.OPENAI_API_KEY ? "on" : "OFF (no OPENAI_API_KEY): graph + BM25 only"}`)
+  yield* Console.log("retrieval: source and title BM25; entity filters resolve aliases")
   yield* Console.log(`work: ${queries.length} queries scored (${golds.length - scored.length} with no relevant document skipped), ${hits} documents returned · errors ${errors} · median ${median(queries.map((row) => row.ms))} ms/query (CLI start included)`)
 })
 

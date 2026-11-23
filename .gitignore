@@ -46,3 +46,4 @@ backup/
 .helix/
 helix.toml
 .audit/
+.exo/
